@@ -1,0 +1,29 @@
+素材清单（已归档，共 17 张，全部为透明 PNG）
+
+【蚩尤 —— 无尽模式追击者】
+chiyou_idle.png        正面站立（黑帽衫红眼）
+chiyou_stand_wing.png  武装站立 · 机械翼展开
+chiyou_run1.png        跑步帧（橙鞋）
+chiyou_run2.png        跑步帧（蓝光拖尾）
+chiyou_run3.png        跑步帧（蓝耳机发光）
+chiyou_skill.png       技能释放后姿态
+chiyou_dash.png        冲刺（朝左，拳带红光）
+chiyou_punch.png       战斗 · 出拳+能量球
+chiyou_punch2.png      战斗 · 出拳（朝右）
+chiyou_slide.png       滑铲/伏地
+
+【蚩尤 · 机甲变身形态】
+chiyou_mech_run.png    机甲跑酷帧 1
+chiyou_mech_run2.png   机甲跑酷帧 2
+chiyou_mech_full.png   机甲全武装（双翼+浮游炮）
+
+【机灵玉兔】
+rabbit_idle.png        正面站立
+rabbit_run1.png        跑步帧 1
+rabbit_run2.png        跑步帧 2
+rabbit_slide.png       滑铲/扑地
+
+备注：
+- 蚩尤的 run1~run4 是同一套跑步动作的不同帧，接入动画时按顺序交替即可
+- 机甲帧等你确定变身机制后再接入
+- 有分类不对的，直接改文件名告诉我一声
