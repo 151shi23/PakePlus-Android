@@ -58,6 +58,7 @@ const SKINS = [
   { id: 'lava',   name: '熔岩',   color: '#ff9a5a', need: 0,  desc: '滚烫的脚力' },
   { id: 'shadow', name: '暗影',   color: '#b48cf0', need: 0,  desc: '夜里看不见' },
   { id: 'gold',   name: '黄金',   color: '#ffd34d', need: 0,  desc: '满星荣耀' },
+  { id: 'maid',   name: '女仆机灵', color: '#e0455a', need: 0,  desc: '女仆装·围裙飘飘' },
 ];
 
 const SKIN_CACHE = {};       // 当前皮肤实际用的图，换肤时重建
@@ -471,6 +472,7 @@ function clearWorld() {
   world.meteors = [];
   world.chains = [];
   world.knives = [];
+  world.shurikens = [];    // 阿坚的手里剑（常态技能弹，屏幕坐标）
   world.nextPowerX = 2600;
   world.gateNextX = 1150;
   world.tstop = 0;          // 时停计时（api.timestop），跨局必须清零
@@ -487,6 +489,8 @@ function clearWorld() {
   UGC_BG.src = '';       // 单关背景随局清空（全局背景不受影响）
   UGC_BG.img = null;
   G.boss = null;
+  G.chiyou = null;    // 追击者每局按局外选择重建（蚩尤/阿坚）
+  G.chaserOverride = null;    // 局内指定的追击者（plan.chaser / api.chaser）随局结束，不泄漏到下一局
   G.nextBossM = 200;
 
   G.boostT = 0;
@@ -722,7 +726,8 @@ function startEndless() {
   G.baseSpeed = BASE_SPEED;
   G.pressed = {};
   // 挂载独立 mod 库：机关mod库里玩家安装的机制/陷阱 mod（与关卡作品的 mod 互不重合）
-  const lib = ugcModsSync();
+  // scope 字段：endless(默认)=只无尽 / level=只官方关 / all=全部模式都生效
+  const lib = ugcModsSync().filter(m => !m.scope || m.scope === 'endless' || m.scope === 'all');
   world.ugcMods = lib.slice(0, UGC_MAX_MODS).map(m => ({
     id: m.id, name: m.name, onSpawn: m.onSpawn, onUpdate: m.onUpdate, img: m.img, err: 0, slow: false, slowCd: 0,
   }));
@@ -792,6 +797,15 @@ function startLevel(idx, reroll) {
   world.genCursor = G.levelEndX + 2000;
   G.state = 'playing';
   G.pressed = {};
+  // 全局机制 mod（scope: level/all）：官方关卡也挂 mod 库，规则改写全局生效
+  const lvLib = ugcModsSync().filter(m => m.scope === 'level' || m.scope === 'all').slice(0, UGC_MAX_MODS);
+  if (lvLib.length) {
+    world.ugcMods = lvLib.map(m => ({ id: m.id, name: m.name, onSpawn: m.onSpawn, onUpdate: m.onUpdate, img: m.img, err: 0, slow: false, slowCd: 0, scope: m.scope }));
+    for (const mod of world.ugcMods) compileUgcMod(mod);
+    for (const mod of world.ugcMods) runUgcFn(mod, 'onSpawn', mod._spawnFn);
+    applyPTuneStart();
+    FX.sfloat(W / 2, 466, '全局 mod ×' + world.ugcMods.length, { color: '#8ce8ff', size: 26, life: 1.6, vy: -6 });
+  }
   Music.duck(0.2);
   Music.start();
   // 开场先亮一下关卡名和这次抽到的目标
@@ -957,14 +971,69 @@ function buildUgcApi(mod) {
     },
     /* 立刻加复活次数（onDeath 钩子里做「自动复活」机制用） */
     revive: n => { G.revive = Math.min(9, (G.revive || 0) + clamp(Math.round(n || 1), 1, 9)); },
-    /* 事件钩子：api.on('jump'|'coin'|'death'|'key'|'tap'|'draw', fn) —— 主动/被动机制的基础
-       key: 按键(info.code/key)；tap: 点击屏幕(info.x/y)；draw: 每帧自定义绘制(info.worldX) */
+    /* 事件钩子：api.on('jump'|'coin'|'death'|'key'|'tap'|'draw'|'menu', fn) —— 主动/被动机制的基础
+       key: 按键(info.code/key)；tap: 点击屏幕(info.x/y)；draw: 每帧自定义绘制(info.worldX)
+       menu: 主菜单每帧绘制（注册类钩子，全局生效——菜单背景装饰/待机演出用） */
     on: (ev, fn) => {
       if (typeof fn !== 'function') return;
-      const k = (['jump', 'coin', 'death', 'key', 'tap', 'draw'].includes(ev)) ? ev : null;
+      const k = (['jump', 'coin', 'death', 'key', 'tap', 'draw', 'menu'].includes(ev)) ? ev : null;
       if (!k) return;
+      if (k === 'menu') {
+        ugcRegPush(UGC_MENU_HOOKS, (api._mod ? api._mod.id : 'x') + '#' + UGC_MENU_HOOKS.length, { mod: api._mod, fn });
+        return;
+      }
       const hs = world.ugcHooks || (world.ugcHooks = {});
       (hs[k] = hs[k] || []).push({ mod: api._mod, fn });
+    },
+    /* ---- 注册自定义模式：api.mode({ id, name, desc, chase?, onStart?, onFrame?, onDraw?, onKey?, onTap?, onDeath? })
+       注册后主菜单出现模式入口（标题下方小卡行）；开局 = 空跑酷沙盒（无原版机关自动生成，chase:true 才有蚩尤），
+       onFrame(api, { dt }) 每帧驱动玩法，api.gameOver({ win, title?, sub? }) 结束本局，api.hud/button/spawn 照常可用 ---- */
+    mode: def => {
+      if (!def || typeof def !== 'object' || !def.id) return;
+      const d = {
+        key: String(def.id).slice(0, 20),
+        id: String(def.id).replace(/[^\w\u4e00-\u9fa5-]/g, '').slice(0, 16) || 'mode',
+        name: String(def.name || '自定义模式').slice(0, 8),
+        desc: String(def.desc || '').slice(0, 26),
+        chase: !!def.chase,
+        mod: api._mod ? { id: api._mod.id, name: api._mod.name, onSpawn: api._mod.onSpawn, onUpdate: api._mod.onUpdate, img: api._mod.img } : null,
+        onStart: typeof def.onStart === 'function' ? def.onStart : null,
+        onFrame: typeof def.onFrame === 'function' ? def.onFrame : null,
+        onKey: typeof def.onKey === 'function' ? def.onKey : null,
+        onTap: typeof def.onTap === 'function' ? def.onTap : null,
+        onDeath: typeof def.onDeath === 'function' ? def.onDeath : null,
+      };
+      ugcRegPush(UGC_MODES, d.key, d);
+    },
+    /* ---- 主菜单按钮：api.menuButton({ label, fn, color? }) —— 主菜单左上角出现一排按钮（注册一次持续显示） ---- */
+    menuButton: opt => {
+      if (!opt || typeof opt.fn !== 'function') return;
+      const label = String(opt.label || '?').slice(0, 5);
+      ugcRegPush(UGC_MENU_BTNS, (api._mod ? api._mod.id : 'x') + ':' + label, {
+        key: (api._mod ? api._mod.id : 'x') + ':' + label,
+        label, mod: api._mod ? { id: api._mod.id, name: api._mod.name } : null, fn: opt.fn,
+      });
+    },
+    /* ---- 结束自定义模式：api.gameOver({ win, title?, sub? }) —— win=true 胜利结算（撒花），false 失败 ---- */
+    gameOver: opt => {
+      if (G.mode !== 'custom' || G.state !== 'playing') return;
+      opt = opt || {};
+      G.customOver = { win: !!opt.win, title: String(opt.title || '').slice(0, 12), sub: String(opt.sub || '').slice(0, 24) };
+      G.state = 'gameover';
+      G.pressed = {};
+      Music.duck(0.08);
+      if (opt.win) {
+        Snd.clear();
+        FX.flashScreen('#ffffff', 0.35);
+        for (let i = 0; i < 46; i++) {
+          FX.sburst(rnd(60, W - 60), rnd(160, 420), 1, {
+            vx0: -140, vx1: 140, vy0: -60, vy1: 160, life0: 0.7, life1: 1.5, size0: 5, size1: 14,
+            color: ['#ffd34d', '#7de08a', '#8fc4f2', '#ff9c8a', '#ffffff'][i % 5],
+          });
+        }
+      } else {
+        Snd.fail();
+      }
     },
     /* 主动技能按钮：api.button({ label, fn, x?, y?, w?, h?, color? }) —— 屏幕上画一个可点按钮
        （手机也能按）；每帧重新调用才会持续显示（与 api.hud 同款重建式）。点击时回调 fn(api) */
@@ -1001,11 +1070,11 @@ function buildUgcApi(mod) {
     /* ---- 经济：api.coin(n) 加/扣金币（负数=消费，做商店用）；api.energy(v) 加/扣能量 ---- */
     coin: n => { G.coins = Math.max(0, (G.coins || 0) + Math.round(+n || 0)); },
     energy: v => { G.energy = clamp((G.energy || 0) + (+v || 0), 0, ENERGY_MAX); },
-    /* ---- 音效：api.snd('jump') —— 按名播放任意内置音效（Snd.名字） ---- */
-    snd: name => { const f = Snd[name]; if (typeof f === 'function') f(); },
-    /* ---- 播报：api.msg('大字', '小字?') —— 屏幕中央公告 ---- */
+    /* ---- 音效：api.snd('jump') —— 按名播放任意内置音效（Snd.名字；菜单探测期静默） ---- */
+    snd: name => { if (!UGC_PROBING) { const f = Snd[name]; if (typeof f === 'function') f(); } },
+    /* ---- 播报：api.msg('大字', '小字?') —— 屏幕中央公告（菜单探测期静默） ---- */
     msg: (text, sub) => {
-      if (!text) return;
+      if (!text || UGC_PROBING) return;
       FX.sfloat(W / 2, 296, String(text).slice(0, 12), { color: '#ffe066', size: 40, life: 1.6 });
       if (sub) FX.sfloat(W / 2, 350, String(sub).slice(0, 20), { color: 'rgba(255,255,255,0.92)', size: 24, life: 1.6 });
     },
@@ -1033,6 +1102,13 @@ function buildUgcApi(mod) {
       if (patch.stun !== undefined && G.chiyou) G.chiyou.hurtT = Math.max(G.chiyou.hurtT || 0, clamp(patch.stun, 0.1, 5));
       return { gap: 300, speed: 1, skills: 1, ...t };
     },
+    /* ---- 追击者切换：'chiyou'=蚩尤 / 'aj'=忍者阿坚（BOSS 战同步换人；局内覆盖，不改局外选择） ---- */
+    chaser: v => {
+      if (v !== 'chiyou' && v !== 'aj') return G.chaserOverride || chaserSkin();
+      G.chaserOverride = v;
+      if (G.chiyou) { G.chiyou.skin = v; G.chiyou.hidden = false; G.chiyou.introT = 0; G.chiyou.cloneOn = false; G.chiyou.marks = 0; G.chiyou.markT = 0; }
+      return v;
+    },
     dist: () => {
       const c = G.chiyou;
       return c ? Math.abs((world.x + PLAYER_X) - (world.x + c.bx + 70)) : 9999;
@@ -1047,9 +1123,9 @@ function buildUgcApi(mod) {
         if (typeof v === 'number' && isFinite(v)) cur[k] = v;
       }
     },
-    /* ---- 换当前局背景（dataURL 或图片 URL，单关优先级） ---- */
+    /* ---- 换当前局背景（dataURL 或图片 URL，单关优先级；菜单探测期静默） ---- */
     bg: src => {
-      if (typeof src !== 'string' || !src) return;
+      if (UGC_PROBING || typeof src !== 'string' || !src) return;
       UGC_BG.src = src;
       UGC_BG.img = null;
     },
@@ -1119,10 +1195,73 @@ function runUgcHook(kind, arg, list) {
   for (const h of hs) {
     try { h.fn(buildUgcApi(h.mod), arg); }
     catch (e) {
-      h.mod.err = (h.mod.err || 0) + 1;
-      if (h.mod.err <= 3) (world.ugcLog = world.ugcLog || []).push((h.mod.name || h.mod.id) + '·' + (list ? kind : 'on' + kind) + ': ' + e.message);
+      if (h.mod) {
+        h.mod.err = (h.mod.err || 0) + 1;
+        if (h.mod.err <= 3) (world.ugcLog = world.ugcLog || []).push((h.mod.name || h.mod.id) + '·' + (list ? kind : 'on' + kind) + ': ' + e.message);
+      }
     }
   }
+}
+
+/* ---------------- 菜单层/全局层注册表：mod 注册的模式·菜单按钮·菜单绘制，跨局存在 ---------------- */
+const UGC_MODES = [];      // api.mode 注册的自定义模式（主菜单入口，按 key 去重覆盖）
+const UGC_MENU_BTNS = [];  // api.menuButton 注册的主菜单按钮（左上角一排）
+const UGC_MENU_HOOKS = []; // api.on('menu', fn) 主菜单每帧绘制钩子
+let UGC_PROBING = false;   // 菜单探测期：带副作用的接口（bg/msg/snd）静默，避免改菜单背景/乱响
+function ugcRegPush(arr, key, val) {
+  const i = arr.findIndex(x => x.key === key);
+  if (i >= 0) arr[i] = val; else arr.push(val);
+}
+/* 菜单探测：在干净空世界跑一遍 mod 库的 onSpawn，收走「注册类」副作用（模式/菜单按钮/菜单钩子），
+   其余副作用随后 clearWorld 抹掉。探测期报错静默（不弹复制报错，菜单不是跑 mod 的地方） */
+function ugcMenuProbe() {
+  clearWorld();
+  UGC_PROBING = true;
+  const lib = ugcModsSync().slice(0, UGC_MAX_MODS);
+  for (const m of lib) {
+    try {
+      const mod = { id: m.id, name: m.name, onSpawn: m.onSpawn, onUpdate: m.onUpdate, img: m.img, err: 0, slow: false, slowCd: 0, scope: m.scope };
+      compileUgcMod(mod);
+      if (mod._spawnFn) mod._spawnFn(buildUgcApi(mod));
+    } catch (e) {}
+  }
+  UGC_PROBING = false;
+  clearWorld();
+}
+
+/* ---------------- 自定义模式：mod 用 api.mode 注册、主菜单进入的玩法沙盒 ----------------
+   沙盒规则：无原版机关自动生成（mod 用 api.make/api.spawn 自建内容）；蚩尤默认不来
+   （mode 定义里 chase:true 才追）；onFrame 每帧驱动玩法；api.gameOver 结束本局。 */
+function startCustomMode(def) {
+  Snd.init();
+  Snd.click();
+  clearWorld();
+  G.mode = 'custom';
+  G.state = 'playing';
+  G.customMode = def;
+  G.customOver = null;
+  def._err = 0;
+  G.baseSpeed = BASE_SPEED;
+  G.pressed = {};
+  const fakeMod = { id: 'mode_' + def.id, name: def.name || def.id };
+  // 模式来源 mod 的 onSpawn 在本局重跑（api.player/api.hud 等注册全部生效）
+  if (def.mod) {
+    world.ugcMods = [{ id: def.mod.id, name: def.mod.name, onSpawn: def.mod.onSpawn, onUpdate: def.mod.onUpdate, img: def.mod.img, err: 0, slow: false, slowCd: 0 }];
+    for (const mod of world.ugcMods) compileUgcMod(mod);
+    for (const mod of world.ugcMods) runUgcFn(mod, 'onSpawn', mod._spawnFn);
+  }
+  // 模式钩子接入事件总线（key/tap/draw/death 走统一派发，报错计入 fakeMod 带容错停用）
+  const hk = world.ugcHooks || (world.ugcHooks = {});
+  if (def.onKey) (hk.key = hk.key || []).push({ mod: fakeMod, fn: def.onKey });
+  if (def.onTap) (hk.tap = hk.tap || []).push({ mod: fakeMod, fn: def.onTap });
+  if (def.onDraw) (hk.draw = hk.draw || []).push({ mod: fakeMod, fn: def.onDraw });
+  if (def.onDeath) (hk.death = hk.death || []).push({ mod: fakeMod, fn: def.onDeath });
+  world._cmFrame = def.onFrame ? { mod: fakeMod, fn: def.onFrame } : null;
+  applyPTuneStart();
+  if (def.onStart) runUgcFn(fakeMod, 'onStart', def.onStart);
+  FX.sfloat(W / 2, 260, def.name || '自定义模式', { color: '#7de08a', size: 42, life: 1.5, vy: -8 });
+  Music.duck(0.2);
+  Music.start();
 }
 
 /* mod 设置的开局属性（护盾/复活）在 onSpawn 跑完后落地 */
@@ -1159,10 +1298,17 @@ function startUgcLevel(item) {
   clearWorld();
   const shell = newWorldShell();
   const endX = buildUgcPlan(item, shell);
-  shell.ugcMods = (item.mods || []).map(m => ({ id: m.id, name: m.name, onSpawn: m.onSpawn, onUpdate: m.onUpdate, img: m.img, err: 0, slow: false, slowCd: 0 }));
+  // 作品自己的 mod + mod 库里 scope=all 的全局 mod（按 id 去重，作品优先）
+  const allLib = ugcModsSync().filter(m => m.scope === 'all').slice(0, UGC_MAX_MODS);
+  const ownIds = new Set((item.mods || []).map(m => m.id));
+  shell.ugcMods = (item.mods || []).map(m => ({ id: m.id, name: m.name, onSpawn: m.onSpawn, onUpdate: m.onUpdate, img: m.img, err: 0, slow: false, slowCd: 0 }))
+    .concat(allLib.filter(m => !ownIds.has(m.id)).map(m => ({ id: m.id, name: m.name, onSpawn: m.onSpawn, onUpdate: m.onUpdate, img: m.img, err: 0, slow: false, slowCd: 0, scope: m.scope })));
   shell.bgAsset = item.bgAsset || null;
   // world 是全局 const：把构建好的 shell 逐属性搬进 world（与 startLevel 同款）
   for (const k in shell) world[k] = shell[k];
+  // 作品 plan 顶层 chaser 字段：指定本局追击者（'chiyou'=蚩尤 / 'aj'=忍者阿坚，chase:true 关卡与 BOSS 同步生效）
+  const planObj = typeof item.plan === 'string' ? (() => { try { return JSON.parse(item.plan); } catch (e) { return null; } })() : (item.plan || null);
+  if (planObj && (planObj.chaser === 'aj' || planObj.chaser === 'chiyou')) G.chaserOverride = planObj.chaser;
   if (item.bgAsset) preloadUgcAssets(item);
   G.mode = 'ugc';
   G.ugcItem = item;
@@ -1257,10 +1403,72 @@ function loadGlobalBg() {
   im.src = src;
 }
 
+/* 全局材质：创造中心替换金币/标题/地面/蚩尤等贴图，全模式生效。
+   localStorage 'jiling_globaltex' = { key: src }；玩家四帧不走这里（皮肤系统管）。 */
+const GLOBAL_TEX = {};   // key -> 已应用的替换 Image
+
+function globalTexMap() {
+  try { return JSON.parse(localStorage.getItem('jiling_globaltex') || '{}') || {}; }
+  catch (e) { return {}; }
+}
+
+/* 应用替换：场景类换 IMG+crop（原值留 _orig 供还原），蚩尤类换 BOSS_IMG */
+function globalTexApply(key, im) {
+  GLOBAL_TEX[key] = im;
+  if (ASSETS[key]) {
+    if (!ASSETS[key]._origImg) { ASSETS[key]._origImg = IMG[key]; ASSETS[key]._origCrop = ASSETS[key].crop; }
+    IMG[key] = im;
+    ASSETS[key].crop = { x: 0, y: 0, w: im.width, h: im.height };
+  } else if (BOSS_ASSETS.indexOf(key) >= 0) {
+    if (!BOSS_IMG._orig) BOSS_IMG._orig = {};
+    if (!BOSS_IMG._orig[key]) BOSS_IMG._orig[key] = BOSS_IMG[key];
+    BOSS_IMG[key] = im;
+  }
+}
+
+function globalTexRestore(key) {
+  delete GLOBAL_TEX[key];
+  if (ASSETS[key] && ASSETS[key]._origImg) {
+    IMG[key] = ASSETS[key]._origImg;
+    ASSETS[key].crop = ASSETS[key]._origCrop;
+  } else if (BOSS_ASSETS.indexOf(key) >= 0 && BOSS_IMG._orig && BOSS_IMG._orig[key]) {
+    BOSS_IMG[key] = BOSS_IMG._orig[key];
+  }
+}
+
+function loadGlobalTex() {
+  const map = globalTexMap();
+  for (const k in map) {
+    (k2 => {
+      const im = new Image();
+      im.onload = () => globalTexApply(k2, im);
+      im.onerror = () => {};
+      im.src = map[k2];
+    })(k);
+  }
+}
+
+/* 设置/清除一个材质槽位；返回 localStorage 是否写入成功（超 5MB 会 false：本次生效但刷新丢） */
+function setGlobalTex(key, src) {
+  const map = globalTexMap();
+  if (src) map[key] = src;
+  else { delete map[key]; globalTexRestore(key); }
+  let ok = true;
+  try { localStorage.setItem('jiling_globaltex', JSON.stringify(map)); } catch (e) { ok = false; }
+  if (src) {
+    const im = new Image();
+    im.onload = () => globalTexApply(key, im);
+    im.onerror = () => {};
+    im.src = src;
+  }
+  return ok;
+}
+
 function restartCurrent() {
   // 重试就是重抽，赛道和目标都换新的
   if (G.mode === 'ugc') restartUgc();
   else if (G.mode === 'level') startLevel(G.levelIndex, true);
+  else if (G.mode === 'custom' && G.customMode) startCustomMode(G.customMode);
   else startEndless();
 }
 
@@ -1275,8 +1483,11 @@ function backToMenu() {
   clearWorld();
   G.state = 'menu';
   G.mode = 'endless';
+  G.customMode = null;
+  G.customOver = null;
   G.pressed = {};
   clearTweens('all');
+  ugcMenuProbe();   // 回菜单重探测 mod 库：刚装/删的 mod 的菜单入口（模式/按钮/钩子）即时生效
 }
 
 function pauseGame() {
@@ -1623,6 +1834,10 @@ const BOSS_ASSETS = [
   'chiyou_idle', 'chiyou_stand_wing', 'chiyou_run1', 'chiyou_run2', 'chiyou_run3',
   'chiyou_skill', 'chiyou_dash', 'chiyou_punch', 'chiyou_punch2', 'chiyou_slide',
   'chiyou_mech_run', 'chiyou_mech_run2', 'chiyou_mech_full',
+  /* 忍者阿坚（第二追击者）：手里剑三连射 / 影袭突进 / 烟雾瞬步；BOSS 战=影分身 */
+  'aj_idle', 'aj_run1', 'aj_run2', 'aj_throw1', 'aj_throw2', 'aj_dive', 'aj_slide', 'aj_shuriken',
+  /* 阿坚专属武器·黑红魔剑：剑气斩 / 居合十字斩；剑气波弹幕 */
+  'ajw_swing1', 'ajw_swing2', 'ajw_swing3', 'ajw_slash',
 ];
 const BOSS_IMG = {};
 
@@ -1635,13 +1850,25 @@ function loadBossSprites() {
   })));
 }
 
-/* BOSS 战（天天酷跑式）：场景锁定不再前进，蚩尤从右侧压制，
-   撑过 30 秒小奖，用飞刀/冲刺砸掉全部血量大奖 */
+/* 追击者选择（局外切换）：'chiyou' | 'aj'，localStorage 'jiling_chaser'；?aj=1 调试覆盖 */
+function chaserSkin() {
+  if (G.chaserOverride) return G.chaserOverride;
+  try { return localStorage.getItem('jiling_chaser') === 'aj' ? 'aj' : 'chiyou'; } catch (e) { return 'chiyou'; }
+}
+
+/* BOSS 战（天天酷跑式）：场景锁定不再前进，追击者从右侧压制，
+   撑过 30 秒小奖，用飞刀/冲刺砸掉全部血量大奖。
+   蚩尤=弹幕+机甲变身；阿坚=影分身（真身脚下红圈是唯一弱点，打中分身只碎烟雾） */
 function startBoss() {
   G.bossCount = (G.bossCount || 0) + 1;
   const hp = 50 + (G.bossCount - 1) * 30;
+  const skin = chaserSkin();
   G.boss = {
-    hp: hp, maxHp: hp, mech: false,
+    hp: hp, maxHp: hp, mech: false, skin: skin,
+    realDx: 0, swapT: 3.2,
+    clones: skin === 'aj'
+      ? [{ dx: -170, real: false, dead: 0 }, { dx: 0, real: true, dead: 0 }, { dx: 170, real: false, dead: 0 }]
+      : null,
     bx: -260, by: GROUND_Y,
     state: 'enter', t: 0, fightT: 0, atkCd: 1.6, frame: 0,
     knifeCd: 0.5, spawned: false,
@@ -1653,17 +1880,18 @@ function startBoss() {
   FX.sfloat(W / 2, 346, '获得飞刀 ×4', { color: '#8ce8ff', size: 30, life: 1.6, vy: -8 });
   Snd.whoosh();
   FX.addShake(0.6);
-  FX.flashScreen('#ff5a4a', 0.3);
-  FX.sfloat(W / 2, 236, '蚩尤 拦住去路！', { color: '#ff8f7e', size: 44, life: 1.7, vy: -10 });
+  FX.flashScreen(skin === 'aj' ? '#b06aff' : '#ff5a4a', 0.3);
+  FX.sfloat(W / 2, 236, skin === 'aj' ? '阿坚 影分身拦住去路！' : '蚩尤 拦住去路！', { color: skin === 'aj' ? '#d3a8ff' : '#ff8f7e', size: 44, life: 1.7, vy: -10 });
   Music.duck(0.15);
 }
 
 function bossFire(pattern) {
   const b = G.boss;
-  const ox = b.bx + 84, oy = GROUND_Y - 128;
+  const ox = b.bx + (b.realDx || 0) + 84, oy = GROUND_Y - 128;
   const px = PLAYER_X + 8, py = player.y - 66;
+  const aj = b.skin === 'aj';   // 阿坚的弹幕画成旋转手里剑
   const fire = (ang, spd, r) => {
-    world.bullets.push({ x: ox, y: oy, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, r: r || 12 });
+    world.bullets.push({ x: ox, y: oy, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, r: r || 12, sp: aj ? 1 : 0, spin: 0 });
   };
   const base = Math.atan2(py - oy, px - ox);
   if (pattern === 'fan') {
@@ -1672,6 +1900,21 @@ function bossFire(pattern) {
   } else if (pattern === 'ring') {
     const n = b.mech ? 10 : 7;
     for (let i = 0; i < n; i++) fire(i * 6.283 / n, 150);
+  } else if (pattern === 'big') {
+    // 阿坚：巨型手里剑，慢速大弹擦身才中
+    fire(base, 285, 23);
+    if (b.mech) fire(base + 0.2, 285, 23);
+  } else if (pattern === 'rain') {
+    // 阿坚狂化：手里剑雨从天而降（y 压在过滤界内）
+    for (let i = 0; i < 5; i++) {
+      world.bullets.push({ x: rnd(PLAYER_X - 80, W - 60), y: -30 - i * 8, vx: 0, vy: 370 + i * 24, r: 13, sp: 1, spin: Math.random() * 6, ground: 1 });
+    }
+  } else if (pattern === 'slash') {
+    // 阿坚：贴地剑气波推进（跳过可躲），狂化后三连
+    const n = b.mech ? 3 : 1;
+    for (let i = 0; i < n; i++) {
+      world.bullets.push({ x: ox + i * 70, y: GROUND_Y - 52, vx: -(295 + i * 65), vy: 0, r: 16, sp: 1, spin: 0, wave: 1 });
+    }
   } else {
     fire(base, b.mech ? 305 : 245, 10);
     if (b.mech) fire(base + 0.14, 305, 10);
@@ -1683,8 +1926,8 @@ function bossDamage(n) {
   const b = G.boss;
   if (!b || b.state === 'transform' || b.state === 'dead' || b.state === 'retreat') return;
   b.hp = Math.max(0, b.hp - n);
-  FX.float(b.bx + 70, GROUND_Y - 240, '-' + n, { color: '#ffd34d', size: 34 });
-  FX.burst(b.bx + 70, GROUND_Y - 190, 20, {
+  FX.float(b.bx + (b.realDx || 0) + 70, GROUND_Y - 240, '-' + n, { color: '#ffd34d', size: 34 });
+  FX.burst(b.bx + (b.realDx || 0) + 70, GROUND_Y - 190, 20, {
     vx0: -320, vx1: 320, vy0: -320, vy1: 100,
     life0: 0.3, life1: 0.6, size0: 6, size1: 16,
     color: ['#ffd34d', '#ff9a5a', '#ffffff'][Math.floor(Math.random() * 3)],
@@ -1698,18 +1941,18 @@ function bossDamage(n) {
     }
     G.energy = ENERGY_MAX;
     FX.flashScreen('#ffd34d', 0.5);
-    FX.sfloat(W / 2, 300, '蚩尤 被击退！', { color: '#ffe066', size: 54, life: 1.7, vy: -10 });
+    FX.sfloat(W / 2, 300, b.skin === 'aj' ? '阿坚 被击退！' : '蚩尤 被击退！', { color: '#ffe066', size: 54, life: 1.7, vy: -10 });
     Snd.clear();
     return;
   }
-  // 半血变身机甲：弹幕升级
+  // 半血变身：蚩尤开机甲，阿坚残影狂化（换位加速 + 弹幕升级）
   if (b.hp <= b.maxHp / 2 && !b.mech) {
     b.mech = true;
     b.state = 'transform';
     b.t = 0;
     world.bullets = [];
-    FX.flashScreen('#8ce8ff', 0.4);
-    FX.sfloat(W / 2, 256, '蚩尤 变身机甲！', { color: '#8ce8ff', size: 42, life: 1.6, vy: -8 });
+    FX.flashScreen(b.skin === 'aj' ? '#ff7ab8' : '#8ce8ff', 0.4);
+    FX.sfloat(W / 2, 256, b.skin === 'aj' ? '阿坚 残影狂化！' : '蚩尤 变身机甲！', { color: b.skin === 'aj' ? '#ff9ac2' : '#8ce8ff', size: 42, life: 1.6, vy: -8 });
     Snd.dash();
   }
 }
@@ -1719,6 +1962,45 @@ function updateBoss(dt) {
   if (!b) return;
   b.t += dt;
   b.frame += dt;
+  const aj = b.skin === 'aj';
+
+  /* 阿坚影分身：分身重生计时 + 战斗中全员烟雾换位（真身脚下红圈是唯一破绽） */
+  if (aj && b.clones) {
+    for (const cl of b.clones) {
+      if (cl.dead > 0) {
+        cl.dead -= dt;
+        if (cl.dead <= 0) {
+          FX.burst(b.bx + cl.dx + 84, GROUND_Y - 110, 10, {
+            vx0: -140, vx1: 140, vy0: -180, vy1: 20, life0: 0.25, life1: 0.5, size0: 6, size1: 15, color: 'rgba(176,106,255,0.8)',
+          });
+        }
+      }
+    }
+    if (b.state === 'fight' || b.state === 'mech') {
+      b.swapT -= dt;
+      if (b.swapT <= 0) {
+        b.swapT = b.mech ? 2.1 : 3.2;
+        const slots = [-170, 0, 170];
+        for (let i = slots.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const tmp = slots[i]; slots[i] = slots[j]; slots[j] = tmp; }
+        for (let i = 0; i < b.clones.length; i++) {
+          const cl = b.clones[i];
+          if (cl.dead <= 0) {
+            FX.burst(b.bx + cl.dx + 84, GROUND_Y - 110, 8, {
+              vx0: -120, vx1: 120, vy0: -160, vy1: 20, life0: 0.2, life1: 0.45, size0: 5, size1: 13, color: 'rgba(200,160,255,0.75)',
+            });
+          }
+          cl.dx = slots[i];
+          if (cl.dead <= 0) {
+            FX.burst(b.bx + cl.dx + 84, GROUND_Y - 110, 8, {
+              vx0: -120, vx1: 120, vy0: -160, vy1: 20, life0: 0.2, life1: 0.45, size0: 5, size1: 13, color: 'rgba(200,160,255,0.75)',
+            });
+          }
+        }
+        b.realDx = (b.clones.find(cl => cl.real) || {}).dx || 0;
+        Snd.dash();
+      }
+    }
+  }
 
   if (b.state === 'enter') {
     // 从左后方追上来，玩家始终跑在他前面
@@ -1731,20 +2013,28 @@ function updateBoss(dt) {
     b.bx += (target - b.bx) * Math.min(1, dt * 0.5);
     b.atkCd -= dt;
     if (b.atkCd <= 0) {
-      /* 招式池随场次扩展：第 n 场解锁 n 个招式，且一半概率直接亮出最新解锁的 */
-      const POOL = ['fan', 'ring', 'direct', 'dashAtk', 'slideAtk', 'quakeAtk', 'chainAtk'];
-      const NAMES = { fan: '扇形弹幕', ring: '环形弹幕', direct: '贯穿弹', dashAtk: '突进爪击', slideAtk: '贴地滑行', quakeAtk: '裂地波', chainAtk: '旋转链锤' };
+      /* 招式池随场次扩展：第 n 场解锁 n 个招式，且一半概率直接亮出最新解锁的。
+         阿坚专属池：扇形/贯穿换成巨型手里剑 + 狂化手里剑雨 */
+      const POOL = aj
+        ? ['fan', 'big', 'slash', 'direct', 'dashAtk', 'slideAtk', 'rain', 'chainAtk']
+        : ['fan', 'ring', 'direct', 'dashAtk', 'slideAtk', 'quakeAtk', 'chainAtk'];
+      const NAMES = aj
+        ? { fan: '扇形剑幕', ring: '环形剑幕', big: '巨型手里剑', slash: '贴地剑气波', direct: '贯穿剑', dashAtk: '居合突进斩', slideAtk: '贴地滑行', rain: '手里剑雨', chainAtk: '旋转链锤', quakeAtk: '裂地波' }
+        : { fan: '扇形弹幕', ring: '环形弹幕', direct: '贯穿弹', dashAtk: '突进爪击', slideAtk: '贴地滑行', quakeAtk: '裂地波', chainAtk: '旋转链锤' };
       const n = Math.min(POOL.length, 1 + (G.bossCount || 1));
       const showNew = n <= POOL.length && Math.random() < 0.5;
-      const pick = showNew ? POOL[n - 1] : POOL[Math.floor(Math.random() * n)];
+      let pick = showNew ? POOL[n - 1] : POOL[Math.floor(Math.random() * n)];
+      if (pick === 'rain' && !b.mech) pick = 'fan';   // 手里剑雨是狂化后限定
       if (showNew && !b.usedNew) {
         b.usedNew = true;
-        FX.sfloat(W / 2, 268, '新技能 · ' + NAMES[pick], { color: '#ff9a8a', size: 36, life: 1.5, vy: -8 });
-        FX.flashScreen('#ff5a4a', 0.12);
+        FX.sfloat(W / 2, 268, '新技能 · ' + NAMES[pick], { color: aj ? '#d3a8ff' : '#ff9a8a', size: 36, life: 1.5, vy: -8 });
+        FX.flashScreen(aj ? '#b06aff' : '#ff5a4a', 0.12);
       }
       if (pick === 'fan') { bossFire('fan'); b.atkCd = b.mech ? rnd(0.9, 1.3) : rnd(1.2, 1.7); }
       else if (pick === 'ring') { bossFire('ring'); b.atkCd = b.mech ? rnd(1.0, 1.4) : rnd(1.4, 1.9); }
       else if (pick === 'direct') { bossFire('direct'); b.atkCd = b.mech ? rnd(0.8, 1.2) : rnd(1.1, 1.6); }
+      else if (pick === 'big') { bossFire('big'); b.atkCd = b.mech ? rnd(1.1, 1.5) : rnd(1.5, 2.0); }
+      else if (pick === 'rain') { bossFire('rain'); b.atkCd = rnd(1.4, 1.9); }
       else if (pick === 'dashAtk') { b.state = 'dashAtk'; b.t = 0; }
       else if (pick === 'slideAtk') { b.state = 'slideAtk'; b.t = 0; }
       else if (pick === 'quakeAtk') { b.state = 'quakeAtk'; b.t = 0; b.spawned = false; }
@@ -1756,7 +2046,7 @@ function updateBoss(dt) {
         world.coins.push({ x: world.x + rnd(260, 490), y: GROUND_Y - rnd(80, 240), phase: rnd(0, 6.28), taken: false });
       }
       G.energy = Math.min(ENERGY_MAX, G.energy + 40);
-      FX.sfloat(W / 2, 320, '蚩尤 暂退了', { color: '#8ce8ff', size: 40, life: 1.4, vy: -8 });
+      FX.sfloat(W / 2, 320, aj ? '阿坚 暂退了' : '蚩尤 暂退了', { color: '#8ce8ff', size: 40, life: 1.4, vy: -8 });
       Snd.clear();
     }
   } else if (b.state === 'transform') {
@@ -1780,22 +2070,24 @@ function updateBoss(dt) {
     if (b.t > 1.3) { b.state = b.mech ? 'mech' : 'fight'; b.t = 0; b.atkCd = rnd(1.2, 1.8); }
   } else if (b.state === 'dashAtk') {
     // 从身后猛冲到玩家脚边出拳——爪子向前够，但身体绝不越过玩家
+    const rdx = b.realDx || 0;
     if (b.t < 0.4) {
-      b.bx += ((PLAYER_X - 92) - b.bx) * Math.min(1, dt * 9);
+      b.bx += ((PLAYER_X - 92 - rdx) - b.bx) * Math.min(1, dt * 9);
     } else if (b.t < 0.78) {
-      b.bx += ((PLAYER_X - 74) - b.bx) * Math.min(1, dt * 4);
-      if (b.bx + 172 > PLAYER_X) { die('boss'); return; }
+      b.bx += ((PLAYER_X - 74 - rdx) - b.bx) * Math.min(1, dt * 4);
+      if (b.bx + rdx + 172 > PLAYER_X) { die('boss'); return; }
     } else {
       b.bx -= 330 * dt;
       if (b.t > 1.4) { b.state = b.mech ? 'mech' : 'fight'; b.t = 0; b.atkCd = rnd(1.2, 1.8); }
     }
   } else if (b.state === 'slideAtk') {
     // 贴地滑铲从后面扫上来，跳起来就安全
+    const rdx = b.realDx || 0;
     if (b.t < 0.42) {
-      b.bx += ((PLAYER_X - 78) - b.bx) * Math.min(1, dt * 8);
+      b.bx += ((PLAYER_X - 78 - rdx) - b.bx) * Math.min(1, dt * 8);
     } else if (b.t < 0.92) {
       b.bx -= 70 * dt;
-      if (b.bx + 152 > PLAYER_X - 14 && player.y > GROUND_Y - 98) { die('boss'); return; }
+      if (b.bx + rdx + 152 > PLAYER_X - 14 && player.y > GROUND_Y - 98) { die('boss'); return; }
     } else {
       b.bx -= 350 * dt;
       if (b.t > 1.5) { b.state = b.mech ? 'mech' : 'fight'; b.t = 0; b.atkCd = rnd(1.2, 1.8); }
@@ -1803,13 +2095,18 @@ function updateBoss(dt) {
   } else if (b.state === 'dead' || b.state === 'retreat') {
     b.bx -= 300 * dt;   // 向左退出屏幕
     if (b.state === 'dead' && Math.random() < 0.35) {
-      FX.burst(b.bx + 70, GROUND_Y - 140, 4, {
+      FX.burst(b.bx + (b.realDx || 0) + 70, GROUND_Y - 140, 4, {
         vx0: -260, vx1: 260, vy0: -260, vy1: 80,
         life0: 0.3, life1: 0.6, size0: 6, size1: 15,
         color: ['#ff9a5a', '#ffd34d', '#ffffff'][Math.floor(Math.random() * 3)],
       });
     }
-    if (b.bx < -520) G.boss = null;   // 完全退出屏幕后才恢复世界滚动
+    if (b.bx < -520) {
+      G.boss = null;   // 完全退出屏幕后才恢复世界滚动
+      // BOSS 战期间世界照常滚动（30s+ 能跑出 200m+），下一场里程碑会被甩在身后导致刚结束就无缝连开
+      // → 结束时把下一场推到当前距离之外，至少再跑 130m
+      if (G.mode === 'endless') G.nextBossM = Math.max(G.nextBossM || 200, Math.ceil(world.x / PX_PER_M) + 130);
+    }
   }
 
   /* 飞刀自动投掷：向身后掷向追兵，命中的伤害结算在刀更新里 */
@@ -1822,30 +2119,56 @@ function updateBoss(dt) {
       Snd.star(1);
     }
   }
-  // 飞刀飞行与命中
+  // 飞刀飞行与命中：蚩尤打本体；阿坚要辨认影分身——真身掉血，分身只碎烟雾
   for (const kn of world.knives) {
     kn.x += kn.vx * dt;
     kn.spin -= dt * 18;
-    if (kn.x > b.bx - 30 && kn.x < b.bx + 160 && kn.y > GROUND_Y - 220) {
+    if (aj && b.clones) {
+      for (const cl of b.clones) {
+        if (cl.dead > 0) continue;
+        const cx = b.bx + cl.dx;
+        if (kn.x > cx - 30 && kn.x < cx + 160 && kn.y > GROUND_Y - 220) {
+          kn.dead = true;
+          if (cl.real) bossDamage(5);
+          else {
+            cl.dead = 2;
+            FX.burst(cx + 84, GROUND_Y - 120, 14, {
+              vx0: -180, vx1: 180, vy0: -220, vy1: 40, life0: 0.25, life1: 0.5, size0: 6, size1: 16, color: 'rgba(176,106,255,0.8)',
+            });
+            FX.float(cx + 70, GROUND_Y - 260, '是影子！', { color: '#d3a8ff', size: 24 });
+            // 碎影奖励：真身被识破会迟滞，下次攻击延后
+            b.atkCd += 1.3;
+            FX.float(b.bx + (b.realDx || 0) + 70, GROUND_Y - 300, '真身迟滞！', { color: '#8ce8ff', size: 20 });
+          }
+          break;
+        }
+      }
+    } else if (kn.x > b.bx - 30 && kn.x < b.bx + 160 && kn.y > GROUND_Y - 220) {
       kn.dead = true;
       bossDamage(5);
     }
   }
   world.knives = world.knives.filter(kn => !kn.dead && kn.x > -80);
 
-  // 能量冲刺撞 BOSS：贴上去每 0.45 秒撞一下
+  // 能量冲刺撞 BOSS：贴上去每 0.45 秒撞一下（只算真身）
   b.dashHitCd = Math.max(0, (b.dashHitCd || 0) - dt);
-  if (G.dashT > 0 && b.dashHitCd <= 0 && Math.abs(b.bx + 90 - (PLAYER_X + 34)) < 130) {
+  if (G.dashT > 0 && b.dashHitCd <= 0 && Math.abs(b.bx + (b.realDx || 0) + 90 - (PLAYER_X + 34)) < 130) {
     b.dashHitCd = 0.45;
     bossDamage(8);
     FX.addShake(0.3);
   }
 
-  // 弹幕（屏幕坐标系）
+  // 弹幕（屏幕坐标系）：阿坚的手里剑额外旋转；剑雨落地即碎
   for (const bl of world.bullets) {
     bl.x += bl.vx * dt;
     bl.y += bl.vy * dt;
+    if (bl.sp) bl.spin += dt * 11;
+    if (bl.ground && bl.y > GROUND_Y - 8) {
+      bl.dead = true;
+      FX.burst(bl.x, GROUND_Y - 20, 6, { vx0: -120, vx1: 120, vy0: -140, vy1: 20, life0: 0.2, life1: 0.4, size0: 4, size1: 10, color: 'rgba(200,160,255,0.8)' });
+    }
   }
+  world.bullets = world.bullets.filter(bl => !bl.dead);
   world.bullets = world.bullets.filter(bl => bl.x > -80 && bl.x < W + 80 && bl.y > -80 && bl.y < H + 80);
 
   // 弹幕命中
@@ -1863,15 +2186,43 @@ function updateBoss(dt) {
 function updateChiyou(dt) {
   let c = G.chiyou;
   if (!c) {
+    /* 追击者由局外选择：蚩尤 / 忍者阿坚（localStorage 'jiling_chaser'） */
+    const skin = chaserSkin();
     c = G.chiyou = {
+      skin: skin,
       bx: -230, t: 0, skillCd: rnd(4, 7), skillT: -1, spawned: false, warnKind: '', kind: 'trap', hitDone: false,
-      /* 蚩尤自己的身体：真跳跃/滑铲物理，会被机关绊到 */
+      /* 他自己的身体：真跳跃/滑铲物理，会被机关绊到 */
       y: GROUND_Y, vy: 0, onGround: true, sliding: false, slideT: 0, hurtT: 0,
+      phase: 0, starsLeft: 0, starT: 0, bigDone: false,
+      marks: 0, markT: 0,           // 忍印：随时间积攒，满 3 层放大招「影分身之术」
+      cloneOn: false, cloneT: 0, cloneBx: 0, cloneStar: 0,   // 影分身活动状态
     };
+    if (skin === 'aj') {
+      // 忍者烟雾登场：藏 0.4 秒后现身
+      c.hidden = true;
+      c.introT = 0.4;
+      FX.burst(96, GROUND_Y - 110, 16, {
+        vx0: -160, vx1: 160, vy0: -200, vy1: 30, life0: 0.3, life1: 0.6, size0: 7, size1: 17, color: 'rgba(200,160,255,0.8)',
+      });
+      FX.sfloat(W / 2, 296, '忍者阿坚 现身！', { color: '#d3a8ff', size: 38, life: 1.5, vy: -9 });
+      Snd.dash();
+    }
   }
   c.t += dt;
   if (c.hurtT > 0) c.hurtT -= dt;
+  // 烟雾登场计时：到点现身
+  if (c.introT > 0) {
+    c.introT -= dt;
+    if (c.introT <= 0) {
+      c.introT = 0;
+      c.hidden = false;
+      FX.burst(c.bx + 70, GROUND_Y - 110, 12, {
+        vx0: -140, vx1: 140, vy0: -170, vy1: 20, life0: 0.25, life1: 0.5, size0: 6, size1: 15, color: 'rgba(200,160,255,0.8)',
+      });
+    }
+  }
 
+  if (!c.hidden) {
   /* ---- 蚩尤 AI：像玩家一样观察前方机关，跳坑跳刺、滑铲钻杆 ---- */
   const cwx = world.x + c.bx + 70;   // 蚩尤身体中心（世界坐标）
   const look = cwx + 115;            // 前视点
@@ -2002,6 +2353,7 @@ function updateChiyou(dt) {
       life0: 0.25, life1: 0.5, size0: 4, size1: 10, color: 'rgba(196,188,172,0.8)',
     });
   }
+  }   // end if (!c.hidden)：烟雾瞬步/登场期间不做 AI、物理、绊倒与跟随
 
   // 空中骨刺：抛物线飞向玩家前方，落地炸出地刺
   if (!world.fireballs) world.fireballs = [];
@@ -2035,6 +2387,80 @@ function updateChiyou(dt) {
   }
   if (world.firePits.length) world.firePits = world.firePits.filter(p => p.t < 1.1);
 
+  // 阿坚的手里剑：直线飞向玩家，长跳/滑铲可躲（站立必中）；巨剑落地成贴地剑阵
+  if (!world.shurikens) world.shurikens = [];
+  for (const st of world.shurikens) {
+    if (st.big) {
+      st.spin += dt * 13;
+      if (!st.landed) {
+        st.x += st.vx * dt;
+        if (st.x >= PLAYER_X + 34) {
+          st.landed = 1; st.landT = 2.5;
+          FX.ring(world.x + st.x, GROUND_Y - 36, { r0: 10, r1: 90, max: 0.35, color: 'rgba(210,150,255,0.9)', width: 6 });
+          FX.addShake(0.22);
+          Snd.spikeOut();
+          if (player.y > GROUND_Y - 90) { st.dead = true; die('shuriken'); return; }   // 落地瞬间贴地扫倒
+        }
+      } else {
+        st.landT -= dt;
+        if (st.landT <= 0) {
+          st.dead = true;
+          FX.burst(st.x, GROUND_Y - 30, 8, { vx0: -120, vx1: 120, vy0: -160, vy1: 20, life0: 0.2, life1: 0.45, size0: 5, size1: 12, color: 'rgba(200,160,255,0.8)' });
+        } else if (player.y > GROUND_Y - 92 && Math.abs(st.x - (PLAYER_X + 34)) < 44) {
+          st.dead = true; die('shuriken'); return;   // 贴地剑阵：站立/滑铲撞上都是死，跳过
+        }
+      }
+      continue;
+    }
+    st.x += st.vx * dt;
+    st.spin += dt * 15;
+    if (st.wave) {
+      // 剑气波：贴地飞行跳过可躲（站立/滑铲都会被切），竖向判定宽
+      st.spin = 0;
+      const box = playerBox();
+      const swx = world.x + st.x;
+      if (swx > box.l - 30 && swx < box.r + 30 && st.y > box.t - 30 && st.y < box.b + 30) {
+        st.dead = true;
+        die('slash');
+        return;
+      }
+      continue;
+    }
+    const box = playerBox();
+    const swx = world.x + st.x;   // 手里剑存屏幕坐标，转世界坐标再与玩家判定框比较
+    if (swx > box.l - 16 && swx < box.r + 16 && st.y > box.t - 16 && st.y < box.b + 16) {
+      st.dead = true;
+      die('shuriken');
+      return;
+    }
+  }
+  world.shurikens = world.shurikens.filter(st => !st.dead && st.x > -120 && st.x < W + 120);
+
+  // 忍印积攒：每 3.2 秒一层，满 3 层下次技能必放大招
+  if (c.skin === 'aj' && c.marks < 3 && c.skillT < 0) {
+    c.markT += dt;
+    if (c.markT >= 3.2) { c.markT = 0; c.marks++; Snd.coin(1); }
+  }
+
+  // 影分身活动期：缀在本体后方一起追，周期性掷剑，到时烟雾消散
+  if (c.cloneOn) {
+    c.cloneT -= dt;
+    if (c.cloneT <= 0) {
+      c.cloneOn = false;
+      FX.burst(c.cloneBx + 70, GROUND_Y - 110, 14, {
+        vx0: -150, vx1: 150, vy0: -190, vy1: 20, life0: 0.25, life1: 0.55, size0: 6, size1: 16, color: 'rgba(200,160,255,0.8)',
+      });
+    } else {
+      c.cloneBx += ((c.bx - 150) - c.cloneBx) * Math.min(1, dt * 2.5);
+      c.cloneStar -= dt;
+      if (c.cloneStar <= 0) {
+        c.cloneStar = rnd(2.0, 2.8);
+        world.shurikens.push({ x: c.cloneBx + 96, y: GROUND_Y - 118, vx: 600, vy: 0, spin: 0 });
+        Snd.star(1);
+      }
+    }
+  }
+
   // 陨石：空中下落 → 落地爆出火焰圈
   for (const m of world.meteors) {
     m.t += dt;
@@ -2056,11 +2482,55 @@ function updateChiyou(dt) {
   }
   if (world.meteors.length) world.meteors = world.meteors.filter(m => m.boom === 0 || m.boom < 0.55);
 
-  // 技能轮换触发：五招轮着来
+  // 技能轮换触发：蚩尤五招 / 阿坚六招轮着来
   c.skillCd -= dt * ((world.cyTune && world.cyTune.skills) || 1);
   if (c.skillCd <= 0 && c.skillT < 0) {
     c.skillT = 0;
     c.spawned = false;
+    if (c.skin === 'aj') {
+      if (c.marks >= 3) {
+        // 大招：影分身之术（耗尽 3 层忍印）
+        c.kind = 'clone';
+        c.marks = 0; c.markT = 0;
+        Snd.dash();
+        FX.flashScreen('#b06aff', 0.16);
+        FX.float(W / 2 - 40, 296, '阿坚 影分身之术！', { color: '#e6ccff', size: 30 });
+      } else {
+      const r = Math.random();
+      c.kind = r < 0.18 ? 'shuriken' : r < 0.36 ? 'nova' : r < 0.52 ? 'smoke' : r < 0.70 ? 'sword' : r < 0.84 ? 'iai' : 'combo';
+      c.phase = 0;
+      if (c.kind === 'shuriken') {
+        c.starsLeft = 3; c.starT = 0; c.bigDone = false;
+        Snd.spikeOut();
+        FX.flashScreen('#b06aff', 0.1);
+        FX.float(W / 2 - 40, 296, '阿坚 掷出手里的剑！', { color: '#d3a8ff', size: 26 });
+      } else if (c.kind === 'nova') {
+        c.hitDone = false;
+        Snd.dash();
+        FX.flashScreen('#b06aff', 0.1);
+        FX.float(W / 2 - 40, 296, '阿坚 影袭来了！跳！', { color: '#c9a0ff', size: 27 });
+      } else if (c.kind === 'sword') {
+        c.swordLeft = 2; c.swordT = 0; c.swordSlash = false; c.slashAnimT = 0;
+        Snd.spikeOut();
+        FX.flashScreen('#ff4d6d', 0.12);
+        FX.float(W / 2 - 40, 296, '阿坚 拔剑了！小心近身！', { color: '#ff8f9e', size: 27 });
+      } else if (c.kind === 'iai') {
+        c.hitDone = false;
+        Snd.dash();
+        FX.flashScreen('#ff4d6d', 0.16);
+        FX.float(W / 2 - 40, 296, '阿坚 居合·十字斩！快跳！', { color: '#ffb0be', size: 29 });
+      } else if (c.kind === 'combo') {
+        c.comboN = 3; c.comboT = 0.05; c.comboHit = false; c.slashAnimT = 0;
+        Snd.dash();
+        FX.flashScreen('#ff4d6d', 0.14);
+        FX.float(W / 2 - 40, 296, '阿坚 贴身连斩！快跳开！', { color: '#ff9aa5', size: 28 });
+      } else {
+        Snd.dash();
+        FX.flashScreen('#b06aff', 0.1);
+        FX.float(W / 2 - 40, 296, '阿坚 消失了！小心头顶！', { color: '#d3a8ff', size: 26 });
+      }
+      }
+    } else {
     const r = Math.random();
     c.kind = r < 0.28 ? 'trap' : r < 0.52 ? 'fireball' : r < 0.70 ? 'claw' : r < 0.85 ? 'quake' : 'meteor';
     if (c.kind === 'trap') {
@@ -2098,10 +2568,186 @@ function updateChiyou(dt) {
       Snd.dash();
       FX.float(W / 2 - 40, 296, '蚩尤 冲过来了！跳！', { color: '#ff9a8a', size: 27 });
     }
+    }   // end skin 分支
   }
   if (c.skillT >= 0) {
     c.skillT += dt;
-    if (c.kind === 'trap') {
+    if (c.skin === 'aj' && c.kind === 'shuriken') {
+      // 上前半步瞄准 → 三连射 → 收尾掷出巨型手里剑，落地成贴地剑阵挡路 2.5 秒
+      c.bx += ((PLAYER_X - 302) - c.bx) * Math.min(1, dt * 1.4);
+      if (c.skillT > 0.55 && c.starsLeft > 0) {
+        c.starT -= dt;
+        if (c.starT <= 0) {
+          c.starT = 0.17;
+          c.starsLeft--;
+          world.shurikens.push({ x: c.bx + 96, y: c.y - 118, vx: 640 + (2 - c.starsLeft) * 55, vy: 0, spin: 0 });
+          Snd.star(1);
+        }
+      }
+      if (c.starsLeft <= 0 && c.skillT > 1.35 && !c.bigDone) {
+        c.bigDone = true;
+        world.shurikens.push({ x: c.bx + 96, y: c.y - 118, vx: 430, vy: 0, spin: 0, big: 1, landed: 0, landT: 0 });
+        Snd.star(1);
+      }
+      if (c.skillT > 2.2) { c.skillT = -1; c.skillCd = rnd(6, 9); }
+    } else if (c.skin === 'aj' && c.kind === 'nova') {
+      // 蓄力抖动 → 贴地影袭突进到玩家脚边 → 横扫（贴地才中，跳起躲开）
+      if (c.skillT < 0.3) {
+        c.bx += rnd(-3, 3);
+      } else if (c.skillT < 0.66) {
+        c.bx += ((PLAYER_X - 58) - c.bx) * Math.min(1, dt * 12);
+        if (Math.random() < 0.7) {
+          FX.burst(c.bx + 60 + rnd(-20, 30), c.y - rnd(10, 60), 1, {
+            vx0: -180, vx1: -40, vy0: -60, vy1: 10, life0: 0.2, life1: 0.4, size0: 4, size1: 10, color: 'rgba(160,110,255,0.8)',
+          });
+        }
+      } else if (c.skillT < 0.92) {
+        if (!c.hitDone) {
+          c.hitDone = true;
+          if (player.y > GROUND_Y - 112) { die('nova'); return; }
+          FX.ring(world.x + PLAYER_X - 24, GROUND_Y - 58, { r0: 14, r1: 130, max: 0.42, color: 'rgba(170,120,255,0.9)', width: 7 });
+          FX.addShake(0.32);
+          Snd.whoosh();
+        }
+      }
+      if (c.skillT > 1.6) { c.skillT = -1; c.skillCd = rnd(6, 9); }
+    } else if (c.skin === 'aj' && c.kind === 'smoke') {
+      // 烟雾瞬步四段：烟雾消失 → 闪现玩家头顶 → 从天而降下劈（跳开躲）→ 落地炸出双向手里剑并归位
+      if (c.skillT < 0.45 && c.phase !== 1) {
+        c.phase = 1;
+        c.hidden = true;
+        FX.burst(c.bx + 70, c.y - 110, 14, {
+          vx0: -150, vx1: 150, vy0: -190, vy1: 20, life0: 0.25, life1: 0.55, size0: 6, size1: 16, color: 'rgba(200,160,255,0.8)',
+        });
+      } else if (c.skillT >= 0.45 && c.skillT < 0.9 && c.phase !== 2) {
+        c.phase = 2;
+        c.hidden = false;
+        c.bx = PLAYER_X + 26;
+        c.y = GROUND_Y - 336;
+        c.vy = 0; c.onGround = false; c.sliding = false;
+        FX.burst(c.bx + 70, c.y - 100, 14, {
+          vx0: -150, vx1: 150, vy0: -190, vy1: 20, life0: 0.25, life1: 0.55, size0: 6, size1: 16, color: 'rgba(200,160,255,0.8)',
+        });
+      } else if (c.skillT >= 0.9 && c.skillT < 1.5 && c.phase !== 3) {
+        c.phase = 3;
+        c.vy = 1750;   // 从天而降
+      }
+      // 下砸落地：踩中判死，跳开则炸出冲击波 + 朝玩家掷一枚回马剑
+      if (c.phase === 3 && c.onGround) {
+        c.phase = 4;
+        if (player.y > GROUND_Y - 116) { die('nova'); return; }
+        FX.ring(world.x + PLAYER_X - 8, GROUND_Y - 50, { r0: 14, r1: 150, max: 0.45, color: 'rgba(170,120,255,0.9)', width: 7 });
+        FX.addShake(0.36);
+        Snd.dash();
+        world.shurikens.push({ x: c.bx + 60, y: c.y - 118, vx: -560, vy: 0, spin: 0 });
+        Snd.star(1);
+      }
+      if (c.skillT >= 2.3) {
+        c.phase = 0;
+        c.hidden = false;
+        c.bx = PLAYER_X - 300;
+        c.y = GROUND_Y; c.vy = 0; c.onGround = true; c.sliding = false;
+        c.skillT = -1;
+        c.skillCd = rnd(6, 9);
+      }
+    } else if (c.skin === 'aj' && c.kind === 'sword') {
+      // 剑气斩：拔剑上前贴近 → 贴身横扫一刀（跳可躲）→ 收尾两道贴地剑气波
+      if (c.slashAnimT > 0) c.slashAnimT -= dt;
+      if (c.skillT < 0.55) {
+        c.bx += ((PLAYER_X - 150) - c.bx) * Math.min(1, dt * 1.8);
+      } else if (c.skillT < 0.85) {
+        if (!c.swordSlash) {
+          c.swordSlash = true; c.slashAnimT = 0.24;
+          Snd.whoosh(); FX.addShake(0.13);
+          FX.ring(world.x + c.bx + 70, GROUND_Y - 90, { r0: 14, r1: 96, max: 0.3, color: 'rgba(255,80,95,0.85)', width: 5 });
+          if (player.y > GROUND_Y - 118) { die('slash'); return; }
+        }
+      } else if (c.swordLeft > 0) {
+        c.swordT -= dt;
+        if (c.swordT <= 0) {
+          c.swordT = 0.16;
+          c.swordLeft--;
+          world.shurikens.push({ x: c.bx + 110, y: GROUND_Y - 58, vx: 700 + (1 - c.swordLeft) * 70, vy: 0, spin: 0, wave: 1 });
+          FX.burst(c.bx + 110, GROUND_Y - 70, 10, {
+            vx0: 60, vx1: 320, vy0: -160, vy1: 60, life0: 0.2, life1: 0.45, size0: 5, size1: 13, color: 'rgba(255,60,80,0.85)',
+          });
+          Snd.whoosh();
+        }
+      }
+      if (c.skillT > 1.9) { c.skillT = -1; c.skillCd = rnd(6, 9); c.swordSlash = false; }
+    } else if (c.skin === 'aj' && c.kind === 'iai') {
+      // 居合·十字斩：泛红蓄力 0.7s（全身高亮预警）→ 瞬间突进穿过玩家（横扫判定，跳开躲）→ 剑气残影
+      if (c.skillT < 0.7) {
+        c.bx += rnd(-3, 3);
+        if (Math.random() < 0.4) {
+          FX.burst(c.bx + 70 + rnd(-30, 30), c.y - rnd(40, 180), 1, {
+            vx0: -40, vx1: 40, vy0: -120, vy1: -20, life0: 0.2, life1: 0.4, size0: 4, size1: 10, color: 'rgba(255,80,100,0.9)',
+          });
+        }
+      } else if (c.skillT < 1.02) {
+        c.bx += ((PLAYER_X + 40) - c.bx) * Math.min(1, dt * 14);
+        if (Math.random() < 0.8) {
+          FX.burst(c.bx + 60 + rnd(-20, 30), c.y - rnd(10, 100), 1, {
+            vx0: -260, vx1: -60, vy0: -80, vy1: 10, life0: 0.2, life1: 0.4, size0: 4, size1: 11, color: 'rgba(255,60,80,0.85)',
+          });
+        }
+      } else if (c.skillT < 1.3) {
+        if (!c.hitDone) {
+          c.hitDone = true;
+          if (player.y > GROUND_Y - 112) { die('slash'); return; }
+          FX.ring(world.x + PLAYER_X, GROUND_Y - 60, { r0: 16, r1: 160, max: 0.4, color: 'rgba(255,70,90,0.9)', width: 8 });
+          FX.addShake(0.38);
+          Snd.crack();
+        }
+      }
+      if (c.skillT > 1.7) { c.skillT = -1; c.skillCd = rnd(6, 9); }
+    } else if (c.skin === 'aj' && c.kind === 'combo') {
+      // 贴身三连斩：瞬间冲到玩家身前 → 三段横扫（每刀独立判定，跳开可躲，刀间 0.42s 间隙）
+      if (c.slashAnimT > 0) c.slashAnimT -= dt;
+      if (c.skillT < 0.4) {
+        c.bx += ((PLAYER_X + 34) - c.bx) * Math.min(1, dt * 13);   // 红影突进贴身
+        if (Math.random() < dt * 34) {
+          FX.burst(c.bx + 44 + rnd(-16, 16), c.y - rnd(16, 110), 1, {
+            vx0: -260, vx1: -60, vy0: -90, vy1: 20, life0: 0.15, life1: 0.4, size0: 4, size1: 11, color: 'rgba(255,60,85,0.85)',
+          });
+        }
+      } else if (c.comboN > 0) {
+        c.comboT -= dt;
+        if (c.comboT <= 0) {
+          c.comboT = 0.42; c.comboN--; c.comboHit = false; c.slashAnimT = 0.2;
+          Snd.whoosh(); FX.addShake(0.14);
+          FX.ring(world.x + c.bx + 64, GROUND_Y - 84, { r0: 14, r1: 92, max: 0.3, color: 'rgba(255,80,95,0.85)', width: 5 });
+        }
+        // 每刀触发后 0.2s 内的横扫判定：贴身站立/滑铲被切，跳过
+        if (!c.comboHit && c.comboT > 0.2 && Math.abs(c.bx - PLAYER_X) < 105 && player.y > GROUND_Y - 118) {
+          c.comboHit = true;
+          die('slash');
+          return;
+        }
+      }
+      if (c.skillT > 2.2) { c.skillT = -1; c.skillCd = rnd(6, 9); c.comboN = 0; }
+    } else if (c.skin === 'aj' && c.kind === 'clone') {
+      // 大招影分身之术：烟雾蓄力 → 分出分身缀在后方一起追 8 秒（分身周期掷剑）
+      if (c.skillT < 0.6) {
+        if (!c.spawned) {
+          c.spawned = true;
+          FX.burst(c.bx + 70, c.y - 110, 18, {
+            vx0: -170, vx1: 170, vy0: -200, vy1: 20, life0: 0.3, life1: 0.6, size0: 7, size1: 17, color: 'rgba(200,160,255,0.85)',
+          });
+          Snd.dash();
+        }
+      } else if (!c.cloneOn) {
+        c.cloneOn = true;
+        c.cloneT = 8;
+        c.cloneBx = Math.min(c.bx - 150, PLAYER_X - 420);
+        c.cloneStar = 2.0;
+        FX.burst(c.cloneBx + 70, GROUND_Y - 110, 16, {
+          vx0: -160, vx1: 160, vy0: -190, vy1: 20, life0: 0.25, life1: 0.55, size0: 6, size1: 16, color: 'rgba(200,160,255,0.8)',
+        });
+        Snd.star(1);
+      }
+      if (c.skillT > 1.2) { c.skillT = -1; c.skillCd = rnd(7, 10); }
+    } else if (c.kind === 'trap') {
       // 释放技能时上前半步，1.3 秒后凭空改出陷阱
       c.bx += ((PLAYER_X - 302) - c.bx) * Math.min(1, dt * 1.4);
       if (c.skillT > 1.3 && !c.spawned) {
@@ -3046,7 +3692,9 @@ function update(dt) {
     if (G.boostT > 0) G.boostT -= dt;
     if (G.cardRevealT < 3.4) G.cardRevealT += dt;
     if (G.mode === 'endless') {
-      G.baseSpeed = Math.min(MAX_SPEED, BASE_SPEED + world.x * 0.0075);
+      // 基础速度渐近增长：前期温和、越往后增速越慢，平滑逼近上限（旧线性 0.0075 跑到 1000m 就 705px/s，太快）
+      // 500m≈449 → 1000m≈523 → 2000m≈640 → 4000m≈741，永不超过 MAX_SPEED
+      G.baseSpeed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * (1 - Math.exp(-world.x / 100000));
       generateAhead();
       const m = Math.floor(world.x / PX_PER_M);
       if (m >= G.nextMile) {
@@ -3057,16 +3705,17 @@ function update(dt) {
       }
     }
     let spd = (G.baseSpeed || BASE_SPEED) + (G.boostT > 0 ? 190 : 0);
-    if (G.buff.slow > 0) spd *= 0.85;
-    if (G.buff.sprint > 0) spd *= 1.25;
-    // 狂暴门：更快但更危险
-    if (G.buff.frenzy > 0) spd *= 1.18;
-    // 传送带加/减速
-    if (G.beltMul && G.beltMul !== 1) spd *= G.beltMul;
-    // 连击越高跑得越快，最多 +12%
-    spd *= 1 + Math.min(0.12, G.combo * 0.006);
-    // 能量冲刺：无敌 + 高速（倍率可被 mod 的 dashSpd 改）
-    if (G.dashT > 0) spd *= (world.pTune && world.pTune.dashSpd) || 1.55;
+    // 速度增益叠乘：冲刺单独放宽，其余满叠也封顶——不封顶后期 1300+px/s 一跳飞 20m+，机关全部形同虚设
+    let gain = 1;
+    if (G.buff.sprint > 0) gain *= 1.25;
+    if (G.buff.frenzy > 0) gain *= 1.18;
+    gain *= 1 + Math.min(0.12, G.combo * 0.006);   // 连击越高跑得越快，最多 +12%
+    if (G.dashT > 0) gain *= (world.pTune && world.pTune.dashSpd) || 1.55;   // 能量冲刺（倍率可被 mod 的 dashSpd 改）
+    if (G.beltMul && G.beltMul > 1) gain *= G.beltMul;   // 传送带加速
+    gain = Math.min(gain, (G.dashT > 0) ? 1.6 : 1.32);
+    if (G.buff.slow > 0) gain *= 0.85;   // 减速不吃上限
+    if (G.beltMul && G.beltMul < 1) gain *= G.beltMul;   // 传送带减速
+    spd *= gain;
     // BOSS 战照常奔跑：边跑酷边对决，只稍微减速给反应空间
     if (G.boss) spd *= 0.96;
     // mod 改的玩家速度（api.player({ speedMul })）
@@ -3138,6 +3787,8 @@ function update(dt) {
       }
     }
     if (G.boss && !(world.tstop > 0)) updateBoss(dt);
+    // 自定义模式：定义里 chase:true 时蚩尤照常追击（无 BOSS 战、无原版机关生成）
+    if (G.mode === 'custom' && G.customMode && G.customMode.chase && !G.boss && !(world.tstop > 0)) updateChiyou(dt);
 
     // 被动补跳冷却
     if (G.airCd > 0) {
@@ -3175,6 +3826,8 @@ function update(dt) {
     } else {
       updateHazards(dt);
       updateUgcMods(dt);
+      // 自定义模式：模式自己的 onFrame 每帧驱动（排在 mod onUpdate 之后，玩法层）
+      if (G.mode === 'custom' && world._cmFrame) runUgcHook('frame', { dt }, [world._cmFrame]);
       updatePlayer(dt);
       updateCoins(dt);
       if (!player.onGround) G.airTime += dt;
