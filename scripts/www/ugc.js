@@ -24,7 +24,7 @@ const UGC_LENM = [50, 2000];       // 关卡长度 clamp 范围（米）
 const UGC_SPEED = [200, 900];      // 基础速度 clamp 范围
 const UGC_MAX_PROJECTS = 12;       // 项目数上限
 const UGC_MAX_ASSET_MB = 2.5;      // 单图体积上限（MB）
-const UGC_MAX_MODS = 12;           // 每关自定义机关上限
+const UGC_MAX_MODS = 30;           // 每关/每局 mod 上限
 const UGC_MAX_CODE = 8000;         // 单段代码字符上限（仅用于报错复制截断，代码本身不截断）
 
 /* ---------- IndexedDB 存储（图片等大对象必须走这里） ---------- */
@@ -260,6 +260,7 @@ function ugcNormMod(m, i, warnings, seen) {
   return {
     id, name: String(m.name || id).slice(0, 12), desc: String(m.desc || '').slice(0, 40),
     tag: ['trap', 'mech', 'ui', 'fun'].includes(m.tag) ? m.tag : 'trap',
+    scope: ['endless', 'level', 'all'].includes(m.scope) ? m.scope : 'endless',
     onSpawn, onUpdate, img: m.img || null,
   };
 }
@@ -359,10 +360,11 @@ function globalBgGet() {
   try { return localStorage.getItem('jiling_globalbg') || ''; } catch (e) { return ''; }
 }
 function globalBgSet(src) {
+  let ok = true;
   try {
     if (src) localStorage.setItem('jiling_globalbg', src);
     else localStorage.removeItem('jiling_globalbg');
-  } catch (e) {}
+  } catch (e) { ok = false; }   // 存不下（超 5MB）：本次会话仍生效，但刷新会丢，UI 层据此提示
   GLOBAL_BG.src = src || '';
   GLOBAL_BG.img = null;
   if (src) {
@@ -371,6 +373,7 @@ function globalBgSet(src) {
     im.onerror = () => { GLOBAL_BG.img = null; };
     im.src = src;
   }
+  return ok;
 }
 
 /* ---------- 分享码 ---------- */
@@ -443,7 +446,7 @@ function ugcEngineDoc() {
 - G.shield 护盾层数(0~2)；G.revive 剩余复活次数；G.buff = { magnet, invinc, djump, x2, slow, sprint, frenzy } 各项为剩余秒数（直接改，如 G.buff.invinc = 5）
 - G.feverT/G.feverNeed 狂热值；G.energy 冲刺能量(0~100)；G.dashT 冲刺剩余时间；G.airJump 剩余补跳；G.airCd 补跳CD
 - G.holdJump/G.holdSlide 按键按住状态（true 时按满跳/按住滑铲）
-- G.chiyou 蚩尤：bx 屏幕x；y/vy/onGround/sliding 物理；hurtT 踉跄剩余秒（写>0 即踉跄闪烁）；skillT（>=0 施法中，<0 空闲）；skillCd 下次技能倒计时；kind 当前技能 'trap'/'fireball'/'claw'/'quake'/'meteor'；waitT>0 = 距玩家过近停下等待中
+- G.chiyou 追击者（skin 字段：'chiyou'=蚩尤 / 'aj'=忍者阿坚，api.chaser 换人）：bx 屏幕x；y/vy/onGround/sliding 物理；hidden=true=烟雾中不可见；hurtT 踉跄剩余秒（写>0 即踉跄闪烁）；skillT（>=0 施法中，<0 空闲）；skillCd 下次技能倒计时；marks/markT 阿坚忍印（0~3，满 3 放大招）；cloneOn/cloneBx 阿坚影分身活动态；kind 当前技能——蚩尤 'trap'/'fireball'/'claw'/'quake'/'meteor'，阿坚 'shuriken'/'nova'/'smoke'/'sword'/'iai'/'combo'/'clone'；waitT>0 = 距玩家过近停下等待中
 - G.boss 非空 = BOSS 战进行中
 
 ■ 世界 world（数组直接 push 即生效，各系统每帧扫描）
@@ -479,17 +482,52 @@ function ugcEngineDoc() {
 - 全局演出：api.timeScale(倍率, 秒) 真·子弹时间（0.2~2.5 倍，玩家/蚩尤/机关一起变速，倒计时走真实时间）；api.msg('大字', '小字?') 屏幕中央公告；api.snd('名字') 播任意内置音效（Snd.名字，如 'jump'/'fever'/'crack'）；api.spawn('coin'|'power', { x?, gy?, vy?, ptype? }) 运行时投放金币/道具球（x 世界坐标默认玩家前方 600px；vy=下落金币雨式；ptype 默认随机）
 - 特效：api.fx.burst(x, y, n, { color }) 粒子；api.fx.float(x, y, '文字') 飘字
 - 改写：api.player(...) / api.chiyou(...) / api.tune(类型, {字段:值}) / api.bg(url) / api.hud(key, 内容) / api.revive(n) / api.timestop(秒)
-- 事件：api.on('jump'|'coin'|'death'|'key'|'tap'|'draw', (api, info) => {...})
+- 事件：api.on('jump'|'coin'|'death'|'key'|'tap'|'draw'|'menu', (api, info) => {...})
   · key: 任意按键，info.code（'KeyE' 等）/info.key —— 自由键位主动技能
   · tap: 点击屏幕，info.x/info.y（屏幕坐标）—— 手机端点按交互
   · draw: 每帧在机关层之上绘制，info.worldX —— 配合全局 ctx 画任意图形
+  · menu: 主菜单每帧绘制（注册一次全局生效，info.w/info.h）—— 菜单装饰/待机演出，配合全局 ctx
 - 主动技能按钮：api.button({ label: '技', fn: (api) => {...}, x?, y?, w?, h?, color? }) —— 屏幕右下角出现可点按钮（手机可按），每帧在 onUpdate 里重新调用才持续显示；点击回调 fn(api)
+- 菜单层/模式层（注册类，onSpawn 里调用一次即全局生效）：
+  · api.menuButton({ label, fn, color? })：主菜单左上角出现一排按钮（最多 4 个），点击回调 fn(api)
+  · api.mode({ id, name, desc, chase?, onStart?, onFrame?, onDraw?, onKey?, onTap?, onDeath? })：注册自定义游戏模式——主菜单标题下方出现模式入口小卡，点击进入「空跑酷沙盒」（无原版机关自动生成、无昼夜/命运门/BOSS；chase:true 才有蚩尤追击；玩家物理/跳跃/滑铲/金币/能量系统照常）。onStart(api) 开局一次；onFrame(api, { dt }) 每帧驱动玩法（在此 api.make/api.spawn 生成内容 + api.hud 画 UI）；onKey/onTap/onDeath 事件；onDraw 每帧绘制
+  · api.gameOver({ win, title?, sub? })：结束自定义模式本局（win=true 胜利撒花结算，title/sub 自定义结算文案），结算界面「再来一次」可重开
 
 【全新机制配方：创造原版没有的机制 = 触发 + 效果 + 表现 任意组合】
 - 触发：api.button 主动技能按钮 / api.on('key') 自由键位 / api.on('tap') 点按 / api.on('jump','coin','death') 被动触发 / onUpdate 里帧计数定时器
 - 效果：直接读写 G/player/world（如 G.buff.invinc=3、player.vy=-1800、world.speed）；或 api.make 生成自定义实体，在 onUpdate 里 api.hazards(type) 驱动移动 + api.hitPlayer(e) 判定 + e.dead=true 销毁
 - 表现：api.fx 粒子飘字 / api.on('draw') + 全局 ctx 画法阵/光圈/任意图形 / api.hud 仪表盘 / Snd.* 音效
-- 参考思路：按 E 召唤陨石雨（key 钩子 + make('meteor2') + draw 画火尾）；主动技「时停」按钮（button + api.timestop）；点击蓄力二段冲刺（tap + player 物理直改）；地面符文法阵（draw 画旋转法阵 + hitPlayer 判定）；金币商店（coin 钩子攒钱 + button 消费换 buff）；蚩尤狂暴条（hud 进度条 + dist() 达阈值改 world.cyTune）`;
+- 参考思路：按 E 召唤陨石雨（key 钩子 + make('meteor2') + draw 画火尾）；主动技「时停」按钮（button + api.timestop）；点击蓄力二段冲刺（tap + player 物理直改）；地面符文法阵（draw 画旋转法阵 + hitPlayer 判定）；金币商店（coin 钩子攒钱 + button 消费换 buff）；蚩尤狂暴条（hud 进度条 + dist() 达阈值改 world.cyTune）
+
+【全自定义 UI 配方（三档能力，从易到难）】
+- 档1 仪表盘 api.hud(key, 内容)：文字 / { text, color, size } / 进度条 { label, val, max, color }。key 相同每帧覆盖，最多同时 16 条。适合倒计时/播报/状态条。
+- 档2 主动按钮 api.button({ label, fn, x?, y?, w?, h?, color? })：不给坐标默认右下纵排；给了 x/y/w/h 就完全自定义位置大小。每帧在 onUpdate 里重调才持续显示。
+- 档3 画布自由绘制 api.on('draw', (a, info) => {...}) + 全局 ctx：整个画面都是你的 UI 画布（屏幕坐标，HUD 类不需要减 world.x）。canvas 2D 全语法可用（fillRect/fillText/arc/渐变/roundRect/贴图）。模板（直接抄）：
+  onSpawn: 'api.on("draw", (a) => { ctx.save(); ctx.fillStyle = "rgba(10,16,28,0.72)"; ctx.fillRect(16, 96, 190, 92); ctx.strokeStyle = "#ffd34d"; ctx.lineWidth = 2; ctx.strokeRect(16, 96, 190, 92); ctx.fillStyle = "#fff"; ctx.font = "bold 22px monospace"; ctx.fillText("金币 " + G.coins, 30, 128); ctx.fillStyle = "#8ce8ff"; ctx.fillText("连击 x" + G.combo, 30, 158); ctx.restore(); });'
+  规则：ctx.save/restore 必须配对；fillText 的 y 是文字基线；半透明底用 rgba；要跟随世界移动的图形用 世界x - info.worldX 换算屏幕坐标；ui 类 mod 记得 tag 用 "ui"。
+
+【全自定义模式配方（onUpdate 写状态机，把无尽改造成你的玩法）】
+- 结构：onSpawn 初始化 G._你的id = { phase, t, wave, ... }；onUpdate 每帧推进状态机（倒计时→切阶段→播报→发内容）。
+- 完整示例「狂潮模式」——每 30 秒触发一波 8 秒狂暴（全场景加速 + 蚩尤逼近 + 金币雨），HUD 显示倒计时：
+  onSpawn: 'G._rush = { t: 30, wave: 0 }; api.msg("狂潮模式", "30 秒后第一波狂暴！");'
+  onUpdate: 'const r = G._rush; r.t -= api.dt; if (r.t <= 0) { r.wave++; if (r.wave % 2 === 1) { r.t = 8; api.timeScale(1.6, 8); api.chiyou({ gap: 150 }); api.msg("第 " + Math.ceil(r.wave / 2) + " 波狂暴！", "速度拉满！"); Snd.fever(); for (let i = 0; i < 12; i++) api.spawn("coin", { vy: 260 + i * 24 }); } else { r.t = 30; api.chiyou({ gap: 260 }); api.msg("狂暴结束", "下一波 30 秒后"); } } api.hud("rush", { label: r.wave % 2 === 1 ? "狂暴剩余" : "下一波狂暴", val: Math.max(0, r.t), max: r.wave % 2 === 1 ? 8 : 30, color: r.wave % 2 === 1 ? "#ff5a4a" : "#8ce8ff" });'
+- 玩法改造面清单：规则 = api.player / api.chiyou / api.tune；时间 = api.timeScale / api.timestop；内容 = api.spawn / api.make；计分 = G.coins / G.combo / G.runTime / api.stats()；生死接管 = api.on('death')（钩子里 api.revive(1) 无限续命 = 不死模式；数死亡次数扣命 = 生命值模式）；得分接管 = api.on('coin')。
+- 提醒：api 对象每次回调都是新实例，mod 状态必须存 G 或 world，绝不能存在 api 上。
+
+【自定义模式配方（api.mode：新增一个从主菜单进入的全新玩法）】
+- 注册：onSpawn 里 api.mode({ id: "你的模式", name: "8字内", desc: "一句话", onStart, onFrame, onDeath })。注册一次全局生效，主菜单自动出现入口小卡。
+- 沙盒规则：开局是空跑道（无原版机关/昼夜/命运门/BOSS），玩家自动前跑、跳/滑铲/金币/能量/道具照常——所有内容靠 onFrame 生成。
+- 完整示例「极限生存」——天降陨石雨，活 45 秒胜利：
+  onSpawn: 'api.mode({ id: "survival", name: "极限生存", desc: "躲陨石雨活45秒", onStart: (a) => { G._svT = 0; a.msg("极限生存", "躲开陨石！"); }, onFrame: (a, info) => { G._svT += info.dt; if (Math.random() < 0.07) a.make("svrock", { x: a.worldX + rnd(120, W - 40), y: -40, vy: 380 + Math.random() * 220, w: 46, h: 46 }); for (const e of a.hazards("svrock")) { e.y += e.vy * info.dt; e.x -= 70 * info.dt; if (e.y > GROUND_Y + 60) e.dead = true; if (a.hitPlayer(e)) { e.dead = true; a.fx.burst(e.x, e.y, 12, {}); a.kill(); } } a.hud("sv", { label: "存活", val: Math.min(45, G._svT), max: 45, color: "#ffd34d" }); if (G._svT >= 45) a.gameOver({ win: true, title: "生存成功！", sub: "你躲过了整场陨石雨" }); }, onDeath: () => {} });'
+- 关键点：内容生成用 api.make（自定义实体）/api.spawn（原版金币道具）；胜负出口必须调 api.gameOver（不调就永远跑下去）；时间/计分状态存 G._你的id（api 每次回调是新实例）；失败结局 = 玩家死亡（onDeath 钩子可记录死因）或 api.gameOver({ win:false })。
+- 更多玩法面：chase:true 让追击者追击（api.chiyou 调凶度；plan 顶层加 "chaser":"aj" 或 api.chaser('aj') 换忍者阿坚）；onKey/onTap 做输入（节奏点击/选择分支）；onDraw + ctx 做模式专属大 UI（倒计时/转场/剧情字）。
+
+【mod 扩展配方（多 mod 组合成玩法包，互不冲突）】
+- 命名空间：mod 私有状态一律 G._你的id_xxx 前缀（如 G._rush.t），别裸写 G.xxx——多个 mod 会互相覆盖。
+- 顺序即依赖：mods 数组顺序 = onSpawn 执行顺序；后装的 mod 的 api.player / api.tune 同字段覆盖先装的（想兜底就放最前，想 override 就放最后）。
+- 跨 mod 协作：A mod 往 G._share 写共享数据（如 G._share = { kills: 0 }，击杀处 kills++），B mod 在 onUpdate 里读它画排行榜/联动效果。
+- 结构建议：一个 mod 做一件事（trap 陷阱 / mech 机制 / ui 界面 / fun 整活），3~8 个组合成主题包；同 id 会去重（后者被丢弃），id 保持英文唯一。
+- 作用域：关卡内 mods 随作品分享、只在本关生效；「机关mod库」的 mod 用 scope 字段控制生效范围——"endless"(默认)=只无尽 / "level"=只官方关卡 / "all"=全部模式（含自定义关卡）都生效。API 完全同一套，代码可互迁。`;
 }
 
 function ugcPrompt(difficulty) {
@@ -569,7 +607,8 @@ mod 是一小段由游戏真实执行的 JS 代码，你可以用它创造任何
 ${ugcEngineDoc()}
 【机制改写速查（api 封装版）】本关内临时生效（与无尽 mod 同一套 API，全都能用）：
 - api.player({ jumpMul, gravMul, speedMul, airJumps, magnet, dashSpd, startShield, revive })：改玩家跳跃力/重力/速度/固有空中跳/金币磁吸范围(0~800)/冲刺倍率(1~3)/开局护盾(0~2)/开局复活次数(0~9)
-- api.chiyou({ gap, speed, skills, stun })：改蚩尤跟随距离（越小越凶）/追速/技能频率/眩晕秒数
+- api.chiyou({ gap, speed, skills, stun })：改追击者跟随距离（越小越凶）/追速/技能频率/眩晕秒数
+- api.chaser('aj'|'chiyou')：换追击者——'aj'=忍者阿坚（手里剑/影袭/烟雾瞬步/忍印影分身，BOSS 战=影分身战），'chiyou'=蚩尤（原版，BOSS 战=机甲变身）；本局内生效，不影响玩家局外选择
 - api.tune('gap', { w: 260 })：改原版机关参数（类型见下方文档，写过的字段之后生成时生效）
 - api.bg('图片URL')：换本关背景
 - api.revive(n)：立刻给玩家 n 次复活机会；api.on('jump'|'coin'|'death'|'key'|'tap'|'draw', (api, info) => {...})：事件钩子（death 里 api.revive(1) 自动复活；key 自由键位；tap 点按；draw 每帧用全局 ctx 自定义绘制）
@@ -701,23 +740,29 @@ function ugcModPrompt() {
 【mod 字段】
 - id: 英文唯一名（也是陷阱实体类型名，无尽跑道会随机生成该类型实体交给你的 onUpdate 驱动）
 - name: 中文名（8 字内）；desc: 一句话说明玩法（30 字内）；tag: trap=机关 / mech=机制 / ui=界面 / fun=整活
+- scope: 生效范围——"endless"(默认)=只无尽模式 / "level"=只官方关卡 / "all"=全部模式（含自定义关卡）都生效
 - onSpawn: 开局执行一次（注册机制、初始化参数）；onUpdate: 每帧执行（驱动实体、更新 UI）
 - img: 可选，陷阱实体贴图。支持 PNG/JPG/SVG（base64 dataURL 或 http 链接）。SVG 记得带 viewBox 与宽高。默认画成旋转刀锋
 
-【三类 mod，至少各来一个】
+【第五类能力：菜单与全新模式（tag 随内容选）】mod 不只能改局内——还能改菜单、造新模式：
+- api.menuButton({ label: "签到", fn: (a) => { a.coin(50); a.msg("签到 +50"); } })：主菜单左上角出现按钮（最多 4 个），注册一次全局生效
+- api.mode({ id, name, desc, onStart, onFrame, onDeath, ... })：注册自定义游戏模式，主菜单自动出现入口小卡；开局是空跑酷沙盒（无原版机关，玩家物理照常），onFrame(api, { dt }) 每帧用 api.make/api.spawn 生成内容、api.hud 画 UI，胜负用 api.gameOver({ win, title, sub }) 结算（完整配方见下方文档【自定义模式配方】）
+- api.on('menu', (a, info) => {...})：主菜单每帧绘制钩子（全局 ctx 画装饰/演出），注册一次全局生效
+
+【四类 mod，前三类至少各来一个（共 3~10 个，上限 30）】
 1. 陷阱/机关（tag: trap）：无尽跑道每隔一段距离自动生成一个你的实体（离地 40~210px、带初速度），你在 onUpdate 里驱动它移动、攻击。用 api.hazards('你的id') 遍历。
 2. 机制改写（tag: mech）：onSpawn 里一次性改规则，也可以在 onUpdate 里做动态机制（低血量触发、连击奖励、按距离变难……用 api.stats() 自由发挥）：
    - api.player({ jumpMul: 1.25 }) 跳更高；{ gravMul: 0.8 } 月球重力；{ speedMul: 1.15 } 跑更快；{ airJumps: 1 } 空中二段跳
    - api.player({ magnet: 260 }) 金币磁吸半径(像素)；{ dashSpd: 2 } 冲刺更快；{ startShield: 1 } 开局护盾；{ revive: 1 } 开局复活次数
-   - api.chiyou({ gap: 180 }) 蚩尤贴更近更凶；{ skills: 1.5 } 技能更频繁；{ stun: 2 } 立即踉跄 2 秒
+   - api.chiyou({ gap: 180 }) 追击者贴更近更凶；{ skills: 1.5 } 技能更频繁；{ stun: 2 } 立即踉跄 2 秒；api.chaser('aj') 换忍者阿坚（忍印满 3 放影分身大招，BOSS 战=影分身战）
    - api.tune('gap', { w: 300 }) 之后生成的坑更宽；api.tune('spikeTrap', { w: 200 }) 刺更宽
    - api.bg('图片URL') 换背景；api.revive(1) 立刻加一次复活
    - 事件钩子（在 onSpawn 里注册）：api.on('jump', (api, info) => {...}) 每次起跳；api.on('coin', (api, info) => {...}) 每次吃金币（info.x/y/combo）；api.on('death', (api, info) => {...}) 玩家死亡时（info.cause 是死因，可在钩子里 api.revive(1) 实现自动复活）
-3. 自定义 UI（tag: ui）：onUpdate 里用 api.hud(key, 内容) 在屏幕左侧注册显示：
-   - 文本：api.hud('tip', '反伤护盾已开启')
-   - 带样式：api.hud('tip', { text: '危险！', color: '#ff8f7e', size: 22 })
-   - 进度条：api.hud('bar', { label: '蚩尤狂暴', val: api.dist() > 200 ? 30 : 90, max: 100, color: '#ff8f7e' })
-   key 相同每帧覆盖；每帧都要重写（不写就不显示）。
+3. 自定义 UI（tag: ui）：三档能力——
+   - 档1 api.hud(key, 内容) 在屏幕左侧注册显示：文本 api.hud('tip', '反伤护盾已开启')；带样式 api.hud('tip', { text: '危险！', color: '#ff8f7e', size: 22 })；进度条 api.hud('bar', { label: '蚩尤狂暴', val: 30, max: 100, color: '#ff8f7e' })。key 相同每帧覆盖，每帧都要重写
+   - 档2 api.button({ label, fn, x?, y?, w?, h?, color? }) 主动技能按钮（手机可按）
+   - 档3 api.on('draw') + 全局 ctx 画布自由绘制（面板/技能栏/任意图形，模板见下方配方）
+4. 整活/演出（tag: fun）：时停、子弹时间、变装、演出类玩法。
 
 【完整 api + 引擎全量文档】
 mod 代码与游戏引擎同作用域——下面文档里的所有全局对象（G / world / player / FX / Snd）和函数都能直接用；api.* 是官方封装的对外接口，优先用 api，需要底层控制时直接操作全局对象。
@@ -770,6 +815,24 @@ function ugcModSample() {
         id: 'bullettime', name: '子弹时间', desc: '按 B 或点右下按钮：全世界慢放 3 秒', tag: 'fun',
         onSpawn: 'const go = () => { if ((G._btCd || 0) > 0) return; G._btCd = 9; api.timeScale(0.4, 3); api.msg("子弹时间", "世界慢放 3 秒"); FX.flashScreen("#9fd8ff", 0.18); Snd.fever(); }; G._btGo = go; api.on("key", (a, i) => { if (i.code === "KeyB") go(); });',
         onUpdate: 'if ((G._btCd || 0) > 0) { G._btCd -= api.dt; api.hud("bt", { label: "慢放冷却", val: 9 - G._btCd, max: 9, color: "#9fd8ff" }); } api.button({ label: "慢放", color: "#2c6199", fn: () => G._btGo && G._btGo() });',
+      },
+      {
+        id: 'datapanel', name: '数据面板', desc: '画布自由绘制的右上角数据面板（金币/连击）', tag: 'ui',
+        onSpawn: 'api.on("draw", (a) => { ctx.save(); ctx.fillStyle = "rgba(10,16,28,0.72)"; ctx.fillRect(W - 226, 96, 210, 84); ctx.strokeStyle = "#8ce8ff"; ctx.lineWidth = 2; ctx.strokeRect(W - 226, 96, 210, 84); ctx.fillStyle = "#ffd34d"; ctx.font = "bold 20px monospace"; ctx.fillText("金币 " + G.coins, W - 212, 126); ctx.fillStyle = "#ffffff"; ctx.fillText("连击 x" + G.combo, W - 212, 154); ctx.restore(); }); api.fx.float(api.x + 300, api.y - 120, "数据面板已加载");',
+        onUpdate: 'api.hud("panel", { text: "数据面板 · 右上角", color: "#8ce8ff", size: 16 });',
+      },
+      {
+        id: 'rushmode', name: '狂潮模式', desc: '每 30 秒一波 8 秒狂暴：全场景加速+蚩尤逼近+金币雨', tag: 'mech',
+        onSpawn: 'G._rush = { t: 30, wave: 0 }; api.msg("狂潮模式", "30 秒后第一波狂暴！");',
+        onUpdate: 'const r = G._rush; r.t -= api.dt; if (r.t <= 0) { r.wave++; if (r.wave % 2 === 1) { r.t = 8; api.timeScale(1.6, 8); api.chiyou({ gap: 150 }); api.msg("第 " + Math.ceil(r.wave / 2) + " 波狂暴！", "速度拉满！"); Snd.fever(); for (let i = 0; i < 12; i++) api.spawn("coin", { vy: 260 + i * 24 }); } else { r.t = 30; api.chiyou({ gap: 260 }); api.msg("狂暴结束", "下一波 30 秒后"); } } api.hud("rush", { label: r.wave % 2 === 1 ? "狂暴剩余" : "下一波狂暴", val: Math.max(0, r.t), max: r.wave % 2 === 1 ? 8 : 30, color: r.wave % 2 === 1 ? "#ff5a4a" : "#8ce8ff" });',
+      },
+      {
+        id: 'menutools', name: '菜单助手', desc: '主菜单左上角签到按钮 + 绿框装饰', tag: 'ui', scope: 'all',
+        onSpawn: 'api.menuButton({ label: "签到", fn: (a) => { a.coin(50); a.msg("签到成功", "金币 +50"); } }); api.on("menu", (a, info) => { ctx.save(); ctx.strokeStyle = "rgba(125,224,138,0.5)"; ctx.lineWidth = 3; ctx.strokeRect(12, 72, info.w - 24, 280); ctx.restore(); });',
+      },
+      {
+        id: 'survival', name: '极限生存', desc: '主菜单新模式：躲陨石雨活 45 秒', tag: 'fun',
+        onSpawn: 'api.mode({ id: "survival", name: "极限生存", desc: "躲陨石雨活45秒", onStart: (a) => { G._svT = 0; G._svGo = true; a.msg("极限生存", "躲开陨石，活 45 秒！"); }, onFrame: (a, info) => { if (G.state !== "playing" || !G._svGo) return; G._svT += info.dt; if (G._svT > 2.5 && Math.random() < 0.05) a.make("svrock", { x: a.worldX + rnd(260, 900), y: -40, vy: 320 + Math.random() * 180, w: 46, h: 46 }); for (const e of a.hazards("svrock")) { e.y += e.vy * info.dt; e.x -= 70 * info.dt; if (e.y > GROUND_Y + 60) e.dead = true; if (a.hitPlayer(e)) { e.dead = true; a.fx.burst(e.x, e.y, 12, { color: "#ff8f7e" }); a.kill(); } } a.hud("sv", { label: "存活时间", val: Math.min(45, G._svT), max: 45, color: G._svT > 36 ? "#7de08a" : "#ffd34d" }); if (G._svT >= 45) { G._svGo = false; a.gameOver({ win: true, title: "生存成功！", sub: "你躲过了整场陨石雨" }); } }, onDeath: () => { G._svGo = false; } });',
       },
     ],
   });
