@@ -391,7 +391,7 @@ function drawHUD() {
   // 标题居中放在顶部空档
   if (G.mode === 'endless' && st !== 'levelclear') {
     const lw = 142;
-    const lh = lw * (462 / 994);
+    const lh = lw * ASSETS.logo.crop.h / ASSETS.logo.crop.w;
     drawImg('logo', Math.round((W - lw) / 2), 24, lw, lh);
   }
 
@@ -718,7 +718,7 @@ function drawMenu() {
 
   // 标题
   const lw = (W < 640 ? 300 : 344) + Math.sin(t * 1.9) * 8;
-  const lh = lw * (462 / 994);
+  const lh = lw * ASSETS.logo.crop.h / ASSETS.logo.crop.w;
   const ly = 84 + Math.sin(t * 1.5) * 6;
   ctx.save();
   ctx.globalAlpha = 0.35;
@@ -741,8 +741,10 @@ function drawMenu() {
   ctx.fillStyle = 'rgba(255,255,255,0.18)';
   ctx.fillRect(mx, by, W - mx * 2, 3);
 
-  // 模式卡片
-  for (const b of getUIButtons().list.filter(x => x.id !== 'skin' && x.id !== 'pet' && x.id !== 'music')) pxCard(b, !!G.pressed[b.id]);
+  // 模式卡片（mini 小卡 = mod 注册的菜单按钮/自定义模式，用按钮样式画）
+  const ubList = getUIButtons().list;
+  for (const b of ubList) if (b.mini) pxButton(b, !!G.pressed[b.id]);
+  for (const b of ubList.filter(x => !x.mini && x.id !== 'skin' && x.id !== 'pet' && x.id !== 'music' && x.id !== 'chaser')) pxCard(b, !!G.pressed[b.id]);
 
   // 皮肤按钮（数据面板右边那块空位）
   const skBtn = getUIButtons().list.find(x => x.id === 'skin');
@@ -842,6 +844,40 @@ function drawMenu() {
       Music.idx < 0 ? 'rgba(190,205,225,0.6)' : '#dfe8f5', 'rgba(10,18,32,0.9)');
   }
 
+  // 追击者按钮（音乐左边那块）：当前追击者头像 + 点击切换 蚩尤↔阿坚（局外生效）
+  const chBtn = getUIButtons().list.find(x => x.id === 'chaser');
+  if (chBtn) {
+    const pressed = !!G.pressed.chaser;
+    const y = chBtn.y + (pressed ? 4 : 0);
+    const k = SKIN.slate;
+    const aj = chaserSkin() === 'aj';
+    pxRect(chBtn.x, chBtn.y + 6, chBtn.w, chBtn.h, 10);
+    ctx.fillStyle = k.deep;
+    ctx.fill();
+    pxRect(chBtn.x, y, chBtn.w, chBtn.h, 10);
+    ctx.fillStyle = aj ? 'rgba(84,54,122,0.92)' : k.main;
+    ctx.fill();
+    ctx.fillStyle = k.hi;
+    ctx.fillRect(chBtn.x + 10, y + 3, chBtn.w - 20, 4);
+    pxRect(chBtn.x, y, chBtn.w, chBtn.h, 10);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = aj ? 'rgba(200,150,255,0.9)' : k.edge;
+    ctx.stroke();
+    // 当前追击者头像（微浮动）
+    const cim = BOSS_IMG[aj ? 'aj_run1' : 'chiyou_run1'] || BOSS_IMG[aj ? 'aj_idle' : 'chiyou_idle'];
+    if (cim) {
+      const bob = Math.sin(G.time * 3) * 3;
+      ctx.save();
+      const chh = 38;
+      const cw2 = chh * cim.width / cim.height;
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(cim, chBtn.x + chBtn.w / 2 - cw2 / 2, y + 6 + bob, cw2, chh);
+      ctx.restore();
+    }
+    pxText(aj ? '追击者·阿坚' : '追击者·蚩尤', chBtn.x + chBtn.w / 2, y + 58, 14,
+      aj ? '#e6ccff' : '#dfe8f5', 'rgba(10,18,32,0.9)');
+  }
+
   // 数据面板：宽屏固定左下与三小钮同行；窄屏（W<640）居中上移进标题空档，避免与按钮重叠
   const stars = G.stars.reduce((a, b) => a + b, 0);
   const pw0 = Math.min(288, W - 56), ph0 = 76;
@@ -878,6 +914,13 @@ function drawMenu() {
   pxText('低杆 / 摆锤 / 石板 → 滑铲 · 能量攒满 = 无敌冲刺', W / 2, 865, hfs, 'rgba(255,255,255,0.78)');
   pxText('无尽：穿门选增益 · 连击攒 FEVER · 夜里小心', W / 2, 891, hfs, '#ffe9a8');
   pxText('机灵糖1', W - 28, 944, 17, 'rgba(255,255,255,0.5)', 'rgba(10,18,32,0.75)', 'right');
+
+  // mod 主菜单绘制钩子（api.on('menu')）：最后执行，可自由叠加装饰/演出（ctx 全局可用）
+  if (typeof UGC_MENU_HOOKS !== 'undefined') {
+    for (const h of UGC_MENU_HOOKS) {
+      try { h.fn(buildUgcApi(h.mod || null), { w: W, h: H }); } catch (e) {}
+    }
+  }
 }
 
 // ---- 皮肤选择 ----
@@ -1266,12 +1309,20 @@ function drawPause() {
 function drawGameOver() {
   ctx.fillStyle = 'rgba(8,14,26,0.68)';
   ctx.fillRect(0, 0, W, H);
-  const fail = G.mode === 'level';
+  // 自定义模式（api.gameOver）结算：mod 给的标题/副标题，否则走默认文案
+  const co = G.mode === 'custom' ? G.customOver : null;
+  const fail = G.mode === 'level' || (co && !co.win);
   pxPanel(48, 218, W - 96, 470, { cut: 16, bg: 'rgba(26,32,48,0.94)' });
 
-  pxText(fail ? '挑战失败' : '游戏结束', W / 2, 290, 52, fail ? '#ff8f7e' : '#ffffff');
+  pxText(co && co.title ? co.title : (fail ? '挑战失败' : '游戏结束'), W / 2, 290, 52,
+    co && !co.win ? '#ff8f7e' : (co && co.win ? '#7de08a' : (fail ? '#ff8f7e' : '#ffffff')));
 
-  if (!fail) {
+  if (co && co.sub) {
+    pxText(co.sub, W / 2, 372, 26, '#ffffff');
+    pxText('金币', 150, 424, 24, 'rgba(190,214,242,0.85)', 'rgba(10,18,32,0.95)');
+    pxNum(String(G.coins), 390, 424, 32, '#ffd34d', 'rgba(10,18,32,0.95)', 'right');
+    pxText(G.customMode ? G.customMode.name : '', W / 2, 482, 24, 'rgba(125,224,138,0.9)');
+  } else if (!fail) {
     const m = Math.floor(world.x / PX_PER_M);
     pxText('距离', 150, 374, 24, 'rgba(190,214,242,0.85)', 'rgba(10,18,32,0.95)');
     pxNum(m + ' m', 390, 374, 32, '#ffffff', 'rgba(10,18,32,0.95)', 'right');
@@ -1408,11 +1459,33 @@ function getUIButtons() {
 
   if (st === 'menu') {
     const mw = Math.min(484, W - 40);
+    // mod 注册的主菜单按钮（api.menuButton）：左上角一排小按钮
+    (typeof UGC_MENU_BTNS !== 'undefined' ? UGC_MENU_BTNS : []).slice(0, 4).forEach((b, i) => {
+      add({
+        id: 'umb' + i, kind: 'slate', label: b.label, mini: true, menuMini: true, labelSize: 19,
+        x: 16 + i * 118, y: 18, w: 108, h: 44,
+        act: () => { try { b.fn(buildUgcApi(b.mod || null)); } catch (e) { try { (world.ugcLog = world.ugcLog || []).push('菜单按钮·' + b.label + ': ' + e.message); } catch (x) {} } },
+      });
+    });
     add({
       id: 'endless', kind: 'gold', label: '无尽模式', sub: '机关随距离逐步解锁',
       x: cx(mw), y: 356, w: mw, h: 104, glow: true, icon: ICO.play,
       act: () => startEndless(),
     });
+    // mod 注册的自定义模式（api.mode）：副标题与无尽之间的小卡行（无 mod 模式时不占位）
+    const modes = (typeof UGC_MODES !== 'undefined' ? UGC_MODES : []).slice(0, 4);
+    if (modes.length) {
+      const n = modes.length;
+      const cw2 = Math.floor((mw - 12 * (n - 1)) / n);
+      modes.forEach((d, i) => {
+        add({
+          id: 'cmode' + d.id, kind: 'green', label: d.name, sub: d.desc || 'mod 自定义模式',
+          mini: true, labelSize: n > 2 ? 21 : 25,
+          x: cx(mw) + i * (cw2 + 12), y: 268, w: cw2, h: 76,
+          act: () => startCustomMode(d),
+        });
+      });
+    }
     add({ id: 'levelmode', kind: 'blue', label: '关卡模式', sub: '牌库 ' + CARD_TOTAL + ' 张 · 每关抽 ' + CARDS_PER_LEVEL + ' 张',
       x: cx(mw), y: 472, w: mw, h: 104, icon: ICO.grid,
       act: () => openLevelSelect(),
@@ -1421,16 +1494,18 @@ function getUIButtons() {
       x: cx(mw), y: 684, w: mw, h: 92, icon: ICO.creative,
       act: () => openCreative(),
     });
-    // 皮肤/宠物/音乐：宽屏靠右与数据面板同行；窄屏居中一行（数据面板已上移让位）
+    // 皮肤/宠物/音乐/追击者：宽屏靠右与数据面板同行；窄屏居中一行（数据面板已上移让位）
     if (W >= 640) {
       add({ id: 'skin', x: W - 100, y: 606, w: 72, h: 76, act: () => openSkinSelect() });
       add({ id: 'pet', x: W - 180, y: 606, w: 72, h: 76, act: () => togglePet() });
       add({ id: 'music', x: W - 260, y: 606, w: 72, h: 76, act: () => musicCycle() });
+      add({ id: 'chaser', x: W - 340, y: 606, w: 72, h: 76, act: () => cycleChaser() });
     } else {
-      const bx0 = Math.round(W / 2) - 120;
+      const bx0 = Math.round(W / 2) - 200;
       add({ id: 'music', x: bx0, y: 606, w: 72, h: 76, act: () => musicCycle() });
       add({ id: 'pet', x: bx0 + 84, y: 606, w: 72, h: 76, act: () => togglePet() });
       add({ id: 'skin', x: bx0 + 168, y: 606, w: 72, h: 76, act: () => openSkinSelect() });
+      add({ id: 'chaser', x: bx0 + 252, y: 606, w: 72, h: 76, act: () => cycleChaser() });
     }
   }
 
@@ -1507,9 +1582,11 @@ function getUIButtons() {
       { id: 'modlib', kind: 'green', label: 'mod 库', sub: '列表·分享·删', act: () => ugcModsUI() },
       { id: 'moddemo', kind: 'blue', label: '载入示例包', sub: '官方 5 个 mod', act: () => ugcModDemoLoad() },
       { id: 'globg', kind: 'slate', label: '全局背景', sub: '通用背景图', act: () => ugcGlobalBgUI() },
+      { id: 'gltex', kind: 'slate', label: '全局材质', sub: '金币·蚩尤·地面', act: () => ugcGlobalTexUI() },
     ];
+    const dw4 = Math.floor((gw * 2 - 36) / 4);   // 四列等宽
     row2.forEach((b, i) => {
-      add({ ...b, x: iX0 + i * (dw + 12), y: CRE_Y.modRowY, w: dw, h: 64, labelSize: 21 });
+      add({ ...b, x: iX0 + i * (dw4 + 12), y: CRE_Y.modRowY, w: dw4, h: 64, labelSize: 19 });
     });
     // ── 分区 C：我的关卡作品 ── 点卡试玩；卡内小按钮 = 分享/素材/删（先注册，命中优先）
     const items = ugcListSync();
